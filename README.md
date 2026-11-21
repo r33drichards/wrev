@@ -74,3 +74,28 @@ Supply credentials through your deployment's secret store. See the
 The listener also requires `WREV_REPOSITORIES` and `WREV_WEBHOOK_SECRET`.
 Both review modes require `OPENAI_MODEL` and `WREV_GITHUB_TOKEN`. Supply
 `CHATGPT_ACCESS_TOKEN` for noninteractive deployments.
+
+### Hosted ChatGPT credentials
+
+Build the listener with `mysql-backend`, apply
+`migrations/002_chatgpt_credentials.sql` to its MySQL database, and configure
+the [verified TLS connection](MYSQL_BACKEND.md). Set two independent runtime
+secrets: `WREV_CREDENTIAL_ADMIN_TOKEN` (at least 32 random ASCII characters)
+and `WREV_CREDENTIAL_ENCRYPTION_KEY` (32 random bytes encoded as 64 hex
+characters). Use the same encryption key on every replica and keep it available
+across deployments. Leave the admin token unset to keep the endpoint disabled.
+
+Send an HTTPS `PUT /admin/chatgpt-credentials` with
+`Authorization: Bearer <WREV_CREDENTIAL_ADMIN_TOKEN>` and a JSON body containing
+`access_token` and `expires_at` (Unix seconds). Include both `refresh_token`
+and the issued OAuth `client_id` to enable refresh. Supply the body from private
+input or a secret manager. HTTP 204 means MySQL accepted the encrypted replacement.
+The endpoint has no read method.
+
+When enabled, the listener reads this record for each model call. It refreshes
+near expiry and stores the rotated credentials under a MySQL lock shared across
+replicas. The hosted credential store takes precedence over the environment
+token for webhook reviews. If a refresh fails or is interrupted, provision a
+fresh grant. Use a dedicated OAuth grant for the deployment so another client
+doesn't independently rotate the same refresh token. Confirm that the deployment
+is eligible for [ChatGPT plan usage](https://developers.openai.com/siwc/token-sharing-open-source).

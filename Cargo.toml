@@ -8,9 +8,11 @@ description = "Label-triggered pull request reviews with read-only GitHub tools"
 [features]
 default = ["quickjs-tools"]
 quickjs-tools = ["dep:rquickjs"]
-mysql-backend = ["dep:mysql", "dep:rustls"]
+mysql-backend = ["dep:mysql", "dep:rustls", "dep:ring", "dep:subtle"]
 
 [dependencies]
+ring = { version = "0.17", optional = true }
+subtle = { version = "2", optional = true }
 sha2 = "0.10"
 mysql = { version = "26", optional = true, default-features = false, features = ["minimal-rust", "rustls-tls-ring"] }
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }

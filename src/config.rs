@@ -93,7 +93,7 @@ pub fn model_timeout() -> Result<Duration> {
     seconds("WREV_MODEL_TIMEOUT_SECS", 180)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, feature = "mysql-backend"))]
 pub fn auth_timeout() -> Result<Duration> {
     seconds("WREV_AUTH_TIMEOUT_SECS", 30)
 }

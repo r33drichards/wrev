@@ -211,6 +211,7 @@ fn run_review(
     model_client: &reqwest::blocking::Client,
     target: &Target,
     required_label: Option<&str>,
+    access_token: impl Fn() -> Result<String>,
 ) -> Result<()> {
     let pr = runtime.block_on(pull(
         client,
@@ -230,7 +231,6 @@ fn run_review(
     );
     let tools = register_tools(client, target, &pr, settings)?;
     let definitions = QuickJsTools::definitions();
-    let token = config::chatgpt_token()?;
     let mut messages = Vec::new();
     agent::run_turn(
         &mut messages,
@@ -239,7 +239,7 @@ fn run_review(
         |messages| {
             crate::model::prompt(
                 model_client,
-                &token,
+                &access_token()?,
                 &settings.model,
                 messages,
                 &definitions,
@@ -306,10 +306,11 @@ pub fn manual() -> Result<()> {
             head: current.head.sha,
         },
         None,
+        config::chatgpt_token,
     )
 }
 
-fn header(request: &Request, name: &'static str) -> Option<String> {
+pub(crate) fn header(request: &Request, name: &'static str) -> Option<String> {
     let mut matches = request
         .headers()
         .iter()
@@ -380,6 +381,17 @@ pub fn listen() -> Result<()> {
     let dedup_capacity = listener.dedup_capacity;
     let seen = Arc::new(Mutex::new(HashSet::new()));
     let worker_seen = Arc::clone(&seen);
+    #[cfg(feature = "mysql-backend")]
+    let credentials = crate::hosted_auth::HostedAuth::from_env()?.map(Arc::new);
+    #[cfg(feature = "mysql-backend")]
+    let worker_credentials = credentials.clone();
+    let access_token = move || {
+        #[cfg(feature = "mysql-backend")]
+        if let Some(store) = &worker_credentials {
+            return store.access_token();
+        }
+        config::chatgpt_token()
+    };
     std::thread::spawn(move || {
         let mut completed = VecDeque::new();
         for target in work {
@@ -390,6 +402,7 @@ pub fn listen() -> Result<()> {
                 &model_client,
                 &target,
                 Some(&worker_label),
+                &access_token,
             );
             let mut seen = worker_seen.lock().expect("review state");
             if result.is_ok() {
@@ -409,6 +422,10 @@ pub fn listen() -> Result<()> {
     for mut request in server.incoming_requests() {
         let status = match (request.method(), request.url()) {
             (&Method::Get, "/health") => 200,
+            #[cfg(feature = "mysql-backend")]
+            (&Method::Put, "/admin/chatgpt-credentials") => credentials
+                .as_ref()
+                .map_or(404, |store| store.put(&mut request)),
             (&Method::Post, "/github/webhook") => webhook_status(
                 &mut request,
                 secret.as_bytes(),

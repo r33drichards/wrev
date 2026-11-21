@@ -42,6 +42,9 @@ impl MySqlBackend {
         let _ = rustls::crypto::ring::default_provider().install_default();
         Self { opts }
     }
+    pub fn connect(&self) -> Result<Conn> {
+        Ok(Conn::new(self.opts.clone())?)
+    }
     /// Run explicitly during setup, not on every turn. Idempotent initial schema.
     pub fn migrate(&self) -> Result<()> {
         let mut conn = Conn::new(self.opts.clone())?;

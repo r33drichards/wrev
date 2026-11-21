@@ -15,6 +15,7 @@ import urllib.request
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--features', default='')
+parser.add_argument('--update-lock', action='store_true', help='Resolve and save an updated WASIX lockfile')
 args = parser.parse_args()
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -79,24 +80,41 @@ assert 'version = "0.13.2"' in manifest
 manifest = manifest.replace('version = "0.13.2"', 'version = "0.12"')
 manifest = manifest.replace('reqwest?/rustls', 'reqwest?/rustls-tls')
 (SDK / 'Cargo.toml').write_text(manifest)
+# Octocrab uses Hyper here. Its optional reqwest dependency still needs to
+# resolve against the version available from the overlay registry.
+octocrab = BUILD / 'octocrab'
+unpack_crate('octocrab', '0.54.9',
+             '319b72643e8fa16dc3278f66439534513b2b65d47ec9cf2b26e7316c0c8ef24a',
+             octocrab)
+manifest = (octocrab / 'Cargo.toml').read_text()
+anchor = '[dependencies.reqwest]\nversion = "0.13"'
+assert manifest.count(anchor) == 1
+manifest = manifest.replace(anchor, '[dependencies.reqwest]\nversion = "0.12"')
+manifest = manifest.replace('reqwest?/rustls"', 'reqwest?/rustls-tls"')
+(octocrab / 'Cargo.toml').write_text(manifest)
+
 manifest = (PROJECT / 'Cargo.toml').read_text()
 old = 'reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "form"] }'
 new = 'reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }'
 assert old in manifest
 manifest = manifest.replace(old, new)
-manifest += '\n[patch.crates-io]\nrmcp = { path = "../rmcp" }\nrquickjs-sys = { path = "../rquickjs-sys" }\n'
+# WASIX has no native CA store. Use the bundled public roots for GitHub TLS.
+old_roots = '"default-client", "rustls", "rustls-ring"'
+assert manifest.count(old_roots) == 1
+manifest = manifest.replace(old_roots, old_roots + ', "rustls-webpki-tokio"')
+manifest += '\n[patch.crates-io]\nrmcp = { path = "../rmcp" }\nrquickjs-sys = { path = "../rquickjs-sys" }\noctocrab = { path = "../octocrab" }\n'
 (PROJECT / 'Cargo.toml').write_text(manifest)
 lock = ROOT / 'wasix' / 'Cargo.lock'
 if lock.exists():
     shutil.copy2(lock, PROJECT / 'Cargo.lock')
-command = ['cargo', 'wasix', 'build', '--release', '--bin', 'minimal-mcp-agent']
+command = ['cargo', 'wasix', 'build', '--release', '--bin', 'wrev']
 command += ['--features', ','.join(filter(None, ['quickjs-tools', args.features]))]
-if lock.exists():
+if not args.update_lock:
     command += ['--locked']
 subprocess.run(command, cwd=PROJECT, check=True,
                env=dict(os.environ, RQUICKJS_SYS_NO_WASI_SDK='1'))
 (ROOT / 'dist').mkdir(exist_ok=True)
-shutil.copy2(PROJECT / 'target/wasm32-wasmer-wasi/release/minimal-mcp-agent.wasm', ROOT / 'dist/minimal-mcp-agent.wasm')
-if not lock.exists():
+shutil.copy2(PROJECT / 'target/wasm32-wasmer-wasi/release/wrev.wasm', ROOT / 'dist/wrev.wasm')
+if args.update_lock:
     shutil.copy2(PROJECT / 'Cargo.lock', lock)
-print('Built dist/minimal-mcp-agent.wasm; no credentials or environment files packaged.')
+print('Built dist/wrev.wasm; no credentials or environment files packaged.')

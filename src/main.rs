@@ -4,6 +4,8 @@ mod auth;
 #[path = "auth_headless.rs"]
 mod auth;
 mod config;
+#[cfg(feature = "mysql-backend")]
+mod hosted_auth;
 mod model;
 mod review;
 
