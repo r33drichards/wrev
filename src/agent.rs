@@ -73,6 +73,18 @@ impl Checkpoint {
 /// A Started tool is ambiguous and stops recovery; no automatic unsafe replay.
 pub fn run_with_hooks(
     state: &mut Checkpoint,
+    prompt_llm: impl FnMut(&[Value]) -> Result<Vec<Value>>,
+    call_tool: impl FnMut(&str, &str) -> Result<Value>,
+    print_text: impl FnMut(&str),
+    hook: &mut dyn LifecycleHook,
+) -> Result<()> {
+    let limit = state.max_rounds;
+    run_with_round_limit(state, Some(limit), prompt_llm, call_tool, print_text, hook)
+}
+
+fn run_with_round_limit(
+    state: &mut Checkpoint,
+    limit: Option<usize>,
     mut prompt_llm: impl FnMut(&[Value]) -> Result<Vec<Value>>,
     mut call_tool: impl FnMut(&str, &str) -> Result<Value>,
     mut print_text: impl FnMut(&str),
@@ -83,7 +95,7 @@ pub fn run_with_hooks(
             Phase::Completed => return Ok(()),
             Phase::Model => {
                 ensure!(
-                    state.model_attempts < state.max_rounds,
+                    limit.is_none_or(|limit| state.model_attempts < limit),
                     "Model attempt limit reached; saved tool results will not be replayed"
                 );
                 state.model_attempts += 1;
@@ -173,20 +185,27 @@ pub fn run_with_hooks(
 }
 
 /// Compatibility entry point: existing CLI/HTTP history remains ephemeral.
-/// Remote errors are displayed as tool results here, as in the original loop.
+/// Pass None to run without a model round cap. Remote errors become tool results.
 pub fn run_turn(
     messages: &mut Vec<Value>,
     input: &str,
-    max_rounds: usize,
+    max_rounds: impl Into<Option<usize>>,
     prompt_llm: impl FnMut(&[Value]) -> Result<Vec<Value>>,
     mut call_tool: impl FnMut(&str, &str) -> Result<Value>,
     print_text: impl FnMut(&str),
 ) -> Result<()> {
-    let mut state = Checkpoint::new("ephemeral", input, messages.clone(), max_rounds);
+    let limit = max_rounds.into();
+    let mut state = Checkpoint::new(
+        "ephemeral",
+        input,
+        messages.clone(),
+        limit.unwrap_or_default(),
+    );
     let mut hook = |_: Event, _: &Checkpoint| Ok(());
     hook.on_event(Event::TurnStarted, &state)?;
-    let result = run_with_hooks(
+    let result = run_with_round_limit(
         &mut state,
+        limit,
         prompt_llm,
         |name, args| {
             Ok(match call_tool(name, args) {
@@ -203,6 +222,31 @@ pub fn run_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unlimited_turn_continues_past_twenty_rounds() {
+        let mut attempts = 0;
+        run_turn(
+            &mut Vec::new(),
+            "review",
+            None,
+            |_| {
+                attempts += 1;
+                Ok(if attempts <= 21 {
+                    vec![
+                        json!({"type":"function_call","call_id":attempts.to_string(),
+                        "name":"read","arguments":"{}"}),
+                    ]
+                } else {
+                    Vec::new()
+                })
+            },
+            |_, _| Ok(Value::Null),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(attempts, 22);
+    }
+
     #[test]
     fn no_tools_breaks_and_next_turn_keeps_history() {
         let mut history = vec![];

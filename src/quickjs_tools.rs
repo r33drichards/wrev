@@ -19,7 +19,6 @@ use tokio::time::{Instant, timeout_at};
 const TIME_LIMIT: Duration = Duration::from_secs(120);
 const MAX_CODE_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 64 * 1024;
-const MAX_CALLS: usize = 32;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -177,7 +176,6 @@ impl QuickJsTools {
             .set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)))
             .await;
         let context = AsyncContext::full(&runtime).await?;
-        let calls = Rc::new(Cell::new(0usize));
         let pending = Rc::new(Cell::new(0usize));
         let uncertain = Rc::new(Cell::new(false));
         let output = Rc::new(RefCell::new(String::new()));
@@ -189,7 +187,6 @@ impl QuickJsTools {
             let call = Func::from(Async(
                 move |server: String, name: String, arguments: String| {
                     let handlers = handlers.clone();
-                    let calls = calls.clone();
                     let pending = pending_calls.clone();
                     let uncertain = failed.clone();
                     async move {
@@ -201,10 +198,9 @@ impl QuickJsTools {
                         if uncertain.get() {
                             return Err(js_error("An earlier tool call has an unknown outcome"));
                         }
-                        if calls.get() >= MAX_CALLS || Instant::now() >= deadline {
-                            return Err(js_error("Tool call limit reached"));
+                        if Instant::now() >= deadline {
+                            return Err(js_error("run_js timed out"));
                         }
-                        calls.set(calls.get() + 1);
                         pending.set(pending.get() + 1);
                         let result = match handler {
                             ToolHandler::Mcp(peer) => match peer
@@ -346,14 +342,18 @@ mod tests {
             if (names.join(",") !== "increment,double") throw new Error("Wrong catalog");
             const first = await mcp.callTool("rust", "increment", {value: 20});
             const second = await mcp.callTool("rust", "double", first.structuredContent);
-            console.log(second.structuredContent.value);
+            let result = second.structuredContent;
+            for (let i = 0; i < 33; i++) {
+                result = (await mcp.callTool("rust", "increment", result)).structuredContent;
+            }
+            console.log(result.value);
         "#;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
         let result =
             runtime.block_on(tools.call("run_js", &json!({"code": code}).to_string(), false))?;
-        assert_eq!(result, json!("42\n"));
+        assert_eq!(result, json!("75\n"));
         Ok(())
     }
 }

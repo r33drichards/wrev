@@ -225,7 +225,7 @@ fn run_review(
     agent::run_turn(
         &mut messages,
         include_str!("review_prompt.md"),
-        20,
+        None,
         |messages| crate::model::prompt(&token, model_name, messages, &definitions),
         |name, args| runtime.block_on(tools.call(name, args, false)),
         |_| {},
