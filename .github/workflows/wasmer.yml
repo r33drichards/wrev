@@ -69,7 +69,7 @@ jobs:
             https://github.com/wasmerio/wasmer/releases/download/v7.5.0/wasmer-linux-amd64.tar.gz \
             | tar -xz -C "$RUNNER_TEMP/wasmer" bin/wasmer
           printf '%s\n' "$RUNNER_TEMP/wasmer/bin" >> "$GITHUB_PATH"
-      - name: Deploy and check the listener
+      - name: Deploy and check the WCGI handler
         env:
           WASMER_TOKEN: ${{ secrets.WASMER_TOKEN }}
         run: |

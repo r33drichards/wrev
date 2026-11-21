@@ -4,36 +4,26 @@ set -euo pipefail
 wasmer run dist/wrev.wasm -- --help | grep -F 'wrev [login'
 wasmer package build --check
 
-port=$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-log=$(mktemp)
-wasmer run dist/wrev.wasm --net \
-  --env "PORT=$port" \
-  --env WREV_WEBHOOK_SECRET=fixture-signing-key \
-  --env WREV_REPOSITORIES=fixture/wrev \
-  --env WREV_GITHUB_TOKEN=fixture-github-token \
-  --env OPENAI_MODEL=fixture-model \
-  -- listen > "$log" 2>&1 &
-listener=$!
-cleanup() {
-  kill "$listener" 2>/dev/null || true
-  wait "$listener" 2>/dev/null || true
-  rm -f "$log"
+request() {
+  local method=$1 path=$2
+  shift 2
+  wasmer run dist/wrev.wasm \
+    --env "REQUEST_METHOD=$method" \
+    --env "PATH_INFO=$path" \
+    --env WREV_WEBHOOK_SECRET=fixture-signing-key \
+    --env WREV_REPOSITORIES=fixture/wrev \
+    --env WREV_GITHUB_TOKEN=fixture-github-token \
+    --env OPENAI_MODEL=fixture-model \
+    "$@" -- wcgi
 }
-trap cleanup EXIT
 
-url="http://127.0.0.1:$port"
-for attempt in {1..45}; do
-  if curl --silent --fail --max-time 1 "$url/health" > /dev/null; then
-    status=$(curl --silent --max-time 3 --output /dev/null --write-out '%{http_code}' \
-      --data '{}' "$url/github/webhook")
-    test "$status" = 401
-    echo 'WASIX listener verified: /health returned 200 and unsigned webhook returned 401'
-    exit 0
-  fi
-  if ! kill -0 "$listener" 2>/dev/null; then
-    break
-  fi
-  sleep 1
-done
-cat "$log"
-exit 1
+health=$(request GET /health </dev/null)
+[[ "$health" == $'Status: 200 OK\r\n'* ]]
+unsigned=$(printf '{}' | request POST /github/webhook)
+[[ "$unsigned" == $'Status: 401 Unauthorized\r\n'* ]]
+signature=$(python3 -c 'import hmac; print(hmac.digest(b"fixture-signing-key", b"{}", "sha256").hex())')
+ping=$(printf '{}' | request POST /github/webhook \
+  --env HTTP_X_GITHUB_EVENT=ping \
+  --env "HTTP_X_HUB_SIGNATURE_256=sha256=$signature")
+[[ "$ping" == $'Status: 204 No Content\r\n'* ]]
+echo 'WCGI verified: health 200, unsigned webhook 401, signed ping 204'

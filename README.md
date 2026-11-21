@@ -24,25 +24,18 @@ hosting, supply the template's Sign in with ChatGPT access token through
 cargo run --locked -- review OWNER/REPO 123
 ```
 
-## Listen for the label
+## Wasmer webhook
 
-Set `WREV_WEBHOOK_SECRET` and `WREV_REPOSITORIES` (a comma-separated
-allowlist of `OWNER/REPO` names). Start the listener:
+Wasmer uses WCGI to start a fresh `wrev wcgi` process for each HTTP request.
+Configure GitHub's Pull requests webhook to send JSON to `/github/webhook`,
+using the same `WREV_WEBHOOK_SECRET` as the app. Set `WREV_REPOSITORIES` to the
+comma-separated repository allowlist. A signed, matching label event runs its
+review inline and returns HTTP 204 on success. Reviews go to stderr as JSON,
+which Wasmer captures in app logs. Keep logs private when reviewing private code.
 
-```sh
-cargo run --locked -- listen
-```
-
-The listener binds `0.0.0.0:$PORT` (8080 by default). Configure a GitHub
-webhook for **Pull requests**, send JSON to `/github/webhook` through HTTPS,
-and use the same signing secret. Create and apply the `wrev` label in each
-repository you want reviewed. `GET /health` is the health endpoint.
-
-The listener acknowledges queued reviews with HTTP 202 and processes them
-one at a time. Deduplication uses repository, PR number, and head SHA. The
-queue and deduplication state are in memory. Restarting the process clears
-both. Reviews go to stdout as JSON, so keep the runner's logs private when
-reviewing private code.
+GitHub expects a webhook response within 10 seconds. A longer review can appear
+as a timed-out delivery, and a redelivery can run the review again. WCGI has no
+cross-invocation queue or deduplication. `GET /health` checks webhook configuration.
 
 ## Deployment configuration
 
@@ -61,23 +54,19 @@ Supply credentials through your deployment's secret store. See the
 | `WREV_SCRIPT_OUTPUT_BYTES` | 65536 | Console output per invocation |
 | `WREV_SCRIPT_MEMORY_BYTES` | 33554432 | QuickJS heap limit |
 | `WREV_SCRIPT_STACK_BYTES` | 262144 | QuickJS stack limit |
-| `WREV_BIND_ADDR` | `0.0.0.0` | Listener IP address |
-| `PORT` | 8080 | Listener port |
 | `WREV_LABEL` | `wrev` | PR label that triggers a review |
-| `WREV_QUEUE_CAPACITY` | 16 | Queued webhook reviews |
-| `WREV_DEDUP_CAPACITY` | 4096 | Recently completed reviews kept for deduplication |
 | `WREV_WEBHOOK_BODY_BYTES` | 1048576 | Maximum webhook request body |
 | `WREV_AUTH_TIMEOUT_SECS` | 30 | One sign-in or credential refresh HTTP request |
 | `WREV_OAUTH_CALLBACK_TIMEOUT_SECS` | 300 | Time to complete the local browser sign-in |
 | `WREV_OAUTH_READ_TIMEOUT_SECS` | 2 | Reading the local sign-in callback |
 
-The listener also requires `WREV_REPOSITORIES` and `WREV_WEBHOOK_SECRET`.
+The WCGI webhook also requires `WREV_REPOSITORIES` and `WREV_WEBHOOK_SECRET`.
 Both review modes require `OPENAI_MODEL` and `WREV_GITHUB_TOKEN`. Supply
 `CHATGPT_ACCESS_TOKEN` for noninteractive deployments.
 
 ### Hosted ChatGPT credentials
 
-Build the listener with `mysql-backend`, apply
+Build with `mysql-backend`, apply
 `migrations/002_chatgpt_credentials.sql` to its MySQL database, and configure
 the [verified TLS connection](MYSQL_BACKEND.md). Set two independent runtime
 secrets: `WREV_CREDENTIAL_ADMIN_TOKEN` (at least 32 random ASCII characters)
@@ -92,7 +81,7 @@ and the issued OAuth `client_id` to enable refresh. Supply the body from private
 input or a secret manager. HTTP 204 means MySQL accepted the encrypted replacement.
 The endpoint has no read method.
 
-When enabled, the listener reads this record for each model call. It refreshes
+When enabled, the webhook handler reads this record for each model call. It refreshes
 near expiry and stores the rotated credentials under a MySQL lock shared across
 replicas. The hosted credential store takes precedence over the environment
 token for webhook reviews. If a refresh fails or is interrupted, provision a

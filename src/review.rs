@@ -1,4 +1,4 @@
-use crate::config::{self, ListenerConfig, ReviewConfig};
+use crate::config::{self, ReviewConfig};
 use anyhow::{Context, Result, anyhow, ensure};
 use hmac::{Hmac, Mac};
 use minimal_mcp_agent::{agent, quickjs_tools::QuickJsTools};
@@ -7,13 +7,13 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Sha256;
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::HashSet,
     env,
-    io::Read,
-    sync::{Arc, Mutex, mpsc},
+    io::{self, Read, Write},
     time::Duration,
 };
-use tiny_http::{Method, Request, Response, Server, StatusCode};
+#[cfg(test)]
+use tiny_http::{Method, Request, Response, Server};
 use tokio::runtime::Runtime;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -212,7 +212,7 @@ fn run_review(
     target: &Target,
     required_label: Option<&str>,
     access_token: impl Fn() -> Result<String>,
-) -> Result<()> {
+) -> Result<Value> {
     let pr = runtime.block_on(pull(
         client,
         &target.repository,
@@ -276,12 +276,10 @@ fn run_review(
         eligible(&final_pr) && final_pr.base.sha == pr.base.sha,
         "Pull request changed during review"
     );
-    println!(
-        "{}",
+    Ok(
         json!({"repository": target.repository, "number": target.number,
-        "head": target.head, "review": review})
-    );
-    Ok(())
+        "head": target.head, "review": review}),
+    )
 }
 
 pub fn manual() -> Result<()> {
@@ -295,7 +293,7 @@ pub fn manual() -> Result<()> {
     let client = authenticate(&runtime)?;
     let settings = ReviewConfig::from_env()?;
     let current = runtime.block_on(pull(&client, &repository, number, settings.github_timeout))?;
-    run_review(
+    let review = run_review(
         &runtime,
         &client,
         &settings,
@@ -307,9 +305,12 @@ pub fn manual() -> Result<()> {
         },
         None,
         config::chatgpt_token,
-    )
+    )?;
+    println!("{review}");
+    Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn header(request: &Request, name: &'static str) -> Option<String> {
     let mut matches = request
         .headers()
@@ -359,8 +360,7 @@ fn labeled_target(
     }))
 }
 
-pub fn listen() -> Result<()> {
-    let secret = config::required("WREV_WEBHOOK_SECRET")?;
+fn repositories() -> Result<HashSet<String>> {
     let repositories: HashSet<_> = config::required("WREV_REPOSITORIES")?
         .split(',')
         .map(|name| name.trim().to_ascii_lowercase())
@@ -369,122 +369,128 @@ pub fn listen() -> Result<()> {
         !repositories.is_empty() && repositories.iter().all(|name| allowed_repo(name)),
         "Expected a comma-separated repository allowlist"
     );
-    let runtime = Runtime::new()?;
-    let client = authenticate(&runtime)?;
-    let settings = ReviewConfig::from_env()?;
-    let model_client = crate::model::client()?;
-    let listener = ListenerConfig::from_env()?;
-    let server =
-        Server::http((listener.bind, listener.port)).map_err(|error| anyhow!("{error}"))?;
-    let (queue, work) = mpsc::sync_channel::<Target>(listener.queue_capacity);
-    let worker_label = listener.label.clone();
-    let dedup_capacity = listener.dedup_capacity;
-    let seen = Arc::new(Mutex::new(HashSet::new()));
-    let worker_seen = Arc::clone(&seen);
-    #[cfg(feature = "mysql-backend")]
-    let credentials = crate::hosted_auth::HostedAuth::from_env()?.map(Arc::new);
-    #[cfg(feature = "mysql-backend")]
-    let worker_credentials = credentials.clone();
-    let access_token = move || {
-        #[cfg(feature = "mysql-backend")]
-        if let Some(store) = &worker_credentials {
-            return store.access_token();
-        }
-        config::chatgpt_token()
-    };
-    std::thread::spawn(move || {
-        let mut completed = VecDeque::new();
-        for target in work {
-            let result = run_review(
-                &runtime,
-                &client,
-                &settings,
-                &model_client,
-                &target,
-                Some(&worker_label),
-                &access_token,
-            );
-            let mut seen = worker_seen.lock().expect("review state");
-            if result.is_ok() {
-                completed.push_back(target);
-                if completed.len() > dedup_capacity
-                    && let Some(old) = completed.pop_front()
-                {
-                    seen.remove(&old);
-                }
-            } else {
-                eprintln!("Review failed for {}#{}", target.repository, target.number);
-                seen.remove(&target);
-            }
-        }
-    });
-
-    for mut request in server.incoming_requests() {
-        let status = match (request.method(), request.url()) {
-            (&Method::Get, "/health") => 200,
-            #[cfg(feature = "mysql-backend")]
-            (&Method::Put, "/admin/chatgpt-credentials") => credentials
-                .as_ref()
-                .map_or(404, |store| store.put(&mut request)),
-            (&Method::Post, "/github/webhook") => webhook_status(
-                &mut request,
-                secret.as_bytes(),
-                &repositories,
-                &listener,
-                &queue,
-                &seen,
-            ),
-            _ => 404,
-        };
-        let _ = request.respond(Response::empty(StatusCode(status)));
-    }
-    Ok(())
+    Ok(repositories)
 }
 
-fn webhook_status(
-    request: &mut Request,
+fn webhook_target(
+    body: impl Read,
+    signature: Option<&str>,
+    event: Option<&str>,
     secret: &[u8],
     repositories: &HashSet<String>,
-    listener: &ListenerConfig,
-    queue: &mpsc::SyncSender<Target>,
-    seen: &Mutex<HashSet<Target>>,
-) -> u16 {
-    let Some(signature) = header(request, "X-Hub-Signature-256") else {
-        return 401;
-    };
-    let event = header(request, "X-GitHub-Event");
-    let mut body = Vec::new();
-    if request
-        .as_reader()
-        .take((listener.body_bytes as u64).saturating_add(1))
-        .read_to_end(&mut body)
+    webhook: &config::WebhookConfig,
+) -> std::result::Result<Target, u16> {
+    let signature = signature.ok_or(401u16)?;
+    let mut bytes = Vec::new();
+    if body
+        .take((webhook.body_bytes as u64).saturating_add(1))
+        .read_to_end(&mut bytes)
         .is_err()
-        || body.len() > listener.body_bytes
+        || bytes.len() > webhook.body_bytes
     {
-        return 413;
+        return Err(413);
     }
-    if !signed(secret, &signature, &body) {
-        return 401;
+    if !signed(secret, signature, &bytes) {
+        return Err(401);
     }
-    if event.as_deref() != Some("pull_request") {
-        return 204;
+    if event != Some("pull_request") {
+        return Err(204);
     }
-    let target = match labeled_target(&body, repositories, &listener.label) {
-        Ok(Some(target)) => target,
-        Ok(None) => return 204,
-        Err(_) => return 400,
-    };
-    let mut seen = seen.lock().expect("review state");
-    if seen.contains(&target) {
-        return 202;
-    }
-    match queue.try_send(target.clone()) {
-        Ok(()) => {
-            seen.insert(target);
-            202
+    labeled_target(&bytes, repositories, &webhook.label)
+        .map_err(|_| 400u16)?
+        .ok_or(204)
+}
+
+fn wcgi_request(method: &str, path: &str) -> Result<u16> {
+    match (method, path) {
+        ("GET", "/health") => {
+            config::required("WREV_WEBHOOK_SECRET")?;
+            config::required("WREV_GITHUB_TOKEN")?;
+            repositories()?;
+            config::WebhookConfig::from_env()?;
+            ReviewConfig::from_env()?;
+            Ok(200)
         }
-        Err(_) => 503,
+        #[cfg(feature = "mysql-backend")]
+        ("PUT", "/admin/chatgpt-credentials") => {
+            let authorization = env::var("HTTP_AUTHORIZATION").ok();
+            Ok(
+                crate::hosted_auth::HostedAuth::from_env()?.map_or(404, |store| {
+                    store.put_body(authorization.as_deref(), io::stdin().lock())
+                }),
+            )
+        }
+        ("POST", "/github/webhook") => {
+            let Ok(signature) = env::var("HTTP_X_HUB_SIGNATURE_256") else {
+                return Ok(401);
+            };
+            let secret = config::required("WREV_WEBHOOK_SECRET")?;
+            let repositories = repositories()?;
+            let webhook = config::WebhookConfig::from_env()?;
+            let event = env::var("HTTP_X_GITHUB_EVENT").ok();
+            let target = match webhook_target(
+                io::stdin().lock(),
+                Some(&signature),
+                event.as_deref(),
+                secret.as_bytes(),
+                &repositories,
+                &webhook,
+            ) {
+                Ok(target) => target,
+                Err(status) => return Ok(status),
+            };
+            let runtime = Runtime::new()?;
+            let client = authenticate(&runtime)?;
+            #[cfg(feature = "mysql-backend")]
+            let credentials = crate::hosted_auth::HostedAuth::from_env()?;
+            let review = run_review(
+                &runtime,
+                &client,
+                &ReviewConfig::from_env()?,
+                &crate::model::client()?,
+                &target,
+                Some(&webhook.label),
+                || {
+                    #[cfg(feature = "mysql-backend")]
+                    if let Some(store) = &credentials {
+                        return store.access_token();
+                    }
+                    config::chatgpt_token()
+                },
+            )?;
+            eprintln!("{review}");
+            Ok(204)
+        }
+        _ => Ok(404),
     }
+}
+
+pub fn wcgi() -> Result<()> {
+    let method = env::var("REQUEST_METHOD").unwrap_or_default();
+    let uri = env::var("REQUEST_URI").unwrap_or_default();
+    let path = env::var("PATH_INFO").ok().filter(|path| !path.is_empty());
+    let path = path
+        .as_deref()
+        .unwrap_or_else(|| uri.split('?').next().unwrap_or_default());
+    let status = wcgi_request(&method, path).unwrap_or_else(|_| {
+        eprintln!("WCGI request failed for a configured route");
+        500
+    });
+    let reason = match status {
+        200 => "OK",
+        204 => "No Content",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        413 => "Content Too Large",
+        503 => "Service Unavailable",
+        _ => "Internal Server Error",
+    };
+    write!(
+        io::stdout().lock(),
+        "Status: {status} {reason}\r\nContent-Type: text/plain\r\n\r\n"
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

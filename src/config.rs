@@ -3,7 +3,6 @@ use config::{Config, ConfigError, Environment, Map};
 use minimal_mcp_agent::quickjs_tools::ScriptLimits;
 use std::{
     env,
-    net::IpAddr,
     num::{NonZeroU32, NonZeroUsize},
     str::FromStr,
     sync::OnceLock,
@@ -24,13 +23,11 @@ fn environment() -> Result<&'static Config> {
             let mut values = Map::new();
             for (key, value) in env::vars_os() {
                 let Ok(key) = key.into_string() else { continue };
-                if !(matches!(
-                    key.as_str(),
-                    "PORT" | "OPENAI_MODEL" | "CHATGPT_ACCESS_TOKEN"
-                ) || key.starts_with("WREV_")
-                    && key.bytes().all(|byte| {
-                        byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
-                    }))
+                if !(matches!(key.as_str(), "OPENAI_MODEL" | "CHATGPT_ACCESS_TOKEN")
+                    || key.starts_with("WREV_")
+                        && key.bytes().all(|byte| {
+                            byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+                        }))
                 {
                     continue;
                 }
@@ -148,32 +145,17 @@ impl ReviewConfig {
     }
 }
 
-pub struct ListenerConfig {
-    pub bind: IpAddr,
-    pub port: u16,
+pub struct WebhookConfig {
     pub label: String,
-    pub queue_capacity: usize,
-    pub dedup_capacity: usize,
     pub body_bytes: usize,
 }
 
-impl ListenerConfig {
+impl WebhookConfig {
     pub fn from_env() -> Result<Self> {
         let label = setting("WREV_LABEL", String::from("wrev"))?;
         ensure!(!label.trim().is_empty(), "WREV_LABEL is empty");
-        let port = setting("PORT", 8080u16)?;
-        ensure!(port > 0, "PORT must be positive");
-        let queue_capacity = positive_size("WREV_QUEUE_CAPACITY", 16)?;
-        ensure!(
-            queue_capacity <= isize::MAX as usize,
-            "WREV_QUEUE_CAPACITY is too large"
-        );
         Ok(Self {
-            bind: setting("WREV_BIND_ADDR", IpAddr::from([0, 0, 0, 0]))?,
-            port,
             label,
-            queue_capacity,
-            dedup_capacity: positive_size("WREV_DEDUP_CAPACITY", 4096)?,
             body_bytes: positive_size("WREV_WEBHOOK_BODY_BYTES", 1024 * 1024)?,
         })
     }
@@ -190,14 +172,12 @@ mod tests {
             ("WREV_OVERRIDE".to_owned(), "45".to_owned()),
             ("WREV_ZERO".to_owned(), "0".to_owned()),
             ("WREV_INVALID".to_owned(), "invalid".to_owned()),
-            ("PORT".to_owned(), "8081".to_owned()),
             ("CHATGPT_ACCESS_TOKEN".to_owned(), "007".to_owned()),
         ]))?;
         assert_eq!(setting_from(&settings, "WREV_UNSET", default)?, default);
         assert_eq!(setting_from(&settings, "WREV_OVERRIDE", default)?.get(), 45);
         assert!(setting_from(&settings, "WREV_ZERO", default).is_err());
         assert!(setting_from(&settings, "WREV_INVALID", default).is_err());
-        assert_eq!(setting_from(&settings, "PORT", 8080_u16)?, 8081);
         assert_eq!(
             optional(&settings, "CHATGPT_ACCESS_TOKEN")?.as_deref(),
             Some("007")

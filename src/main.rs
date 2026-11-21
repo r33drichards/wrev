@@ -22,10 +22,10 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
-        Some("listen") => review::listen(),
+        Some("wcgi") => review::wcgi(),
         Some("review") => review::manual(),
         None | Some("-h" | "--help") => {
-            println!("wrev [login | logout | models | listen | review OWNER/REPO PR_NUMBER]");
+            println!("wrev [login | logout | models | wcgi | review OWNER/REPO PR_NUMBER]");
             Ok(())
         }
         Some(other) => bail!("Unknown command: {other}"),

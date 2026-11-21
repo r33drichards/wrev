@@ -13,7 +13,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use subtle::ConstantTimeEq;
-use tiny_http::Request;
 
 const MAX_BODY: u64 = 32 * 1024;
 const ROW_CONTEXT: &[u8] = b"wrev/chatgpt-credentials/v1";
@@ -183,28 +182,20 @@ impl HostedAuth {
         Ok(next.access_token)
     }
 
-    pub fn put(&self, request: &mut Request) -> u16 {
-        let Some(header) = crate::review::header(request, "Authorization") else {
-            return 401;
-        };
-        let Some(token) = header.strip_prefix("Bearer ") else {
+    pub fn put_body(&self, authorization: Option<&str>, body: impl Read) -> u16 {
+        let Some(token) = authorization.and_then(|header| header.strip_prefix("Bearer ")) else {
             return 401;
         };
         let digest: [u8; 32] = Sha256::digest(token).into();
         if !bool::from(digest.ct_eq(&self.admin_digest)) {
             return 401;
         }
-        let mut body = Vec::new();
-        if request
-            .as_reader()
-            .take(MAX_BODY + 1)
-            .read_to_end(&mut body)
-            .is_err()
-            || body.len() as u64 > MAX_BODY
+        let mut bytes = Vec::new();
+        if body.take(MAX_BODY + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 > MAX_BODY
         {
             return 413;
         }
-        let Ok(credentials) = serde_json::from_slice::<Credentials>(&body) else {
+        let Ok(credentials) = serde_json::from_slice::<Credentials>(&bytes) else {
             return 400;
         };
         if credentials.validate().is_err()
@@ -332,7 +323,8 @@ mod tests {
                 let mut request = server
                     .recv_timeout(std::time::Duration::from_secs(10))?
                     .context("Missing fixture request")?;
-                let status = store.put(&mut request);
+                let authorization = crate::review::header(&request, "Authorization");
+                let status = store.put_body(authorization.as_deref(), request.as_reader());
                 request.respond(tiny_http::Response::empty(tiny_http::StatusCode(status)))?;
             }
             Ok(store)

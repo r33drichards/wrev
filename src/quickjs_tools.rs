@@ -191,7 +191,7 @@ impl QuickJsTools {
             "Invalid run_js code length"
         );
         if report {
-            println!("Tool: run_js");
+            eprintln!("Tool: run_js");
         }
 
         let deadline = Instant::now() + self.limits.timeout;

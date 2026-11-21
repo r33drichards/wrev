@@ -10,4 +10,7 @@ abi = "wasi"
 [[command]]
 name = "wrev"
 module = "wrev"
-runner = "wasi"
+runner = "https://webc.org/runner/wcgi"
+
+[command.annotations.wcgi]
+dialect = "rfc-3875"

@@ -24,11 +24,12 @@ The [Wasmer workflow](.github/workflows/wasmer.yml) runs on manual dispatch
 from `main`. The build job validates the package and uploads it. The deployment
 job uses the GitHub `production` environment and reads `WASMER_TOKEN` from its
 secrets. It deploys the artifact to `r33drichards/wrev` with a commit-specific
-package version. It checks the deployment URL for a healthy listener and
+package version. It checks the deployment URL for a healthy WCGI handler and
 verifies that an unsigned webhook receives HTTP 401.
 
 Configure `WREV_GITHUB_TOKEN`, `WREV_WEBHOOK_SECRET`, `WREV_REPOSITORIES`, and
-`OPENAI_MODEL` on the Wasmer app before verifying a deployment. See
+`OPENAI_MODEL` on the Wasmer app before verifying a deployment. The package uses the WCGI runner
+and starts `wrev wcgi` for each HTTP request. See
 [the listener setup](README.md#listen-for-the-label) and
 [hosted credential setup](README.md#hosted-chatgpt-credentials) for the webhook
 and MySQL configuration. Apply the hosted credential migration separately
