@@ -1,43 +1,83 @@
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use config::{Config, ConfigError, Environment, Map};
 use minimal_mcp_agent::quickjs_tools::ScriptLimits;
 use std::{
     env,
     net::IpAddr,
     num::{NonZeroU32, NonZeroUsize},
     str::FromStr,
+    sync::OnceLock,
     time::Duration,
 };
 
+fn from_environment(values: Map<String, String>) -> Result<Config, ConfigError> {
+    Config::builder()
+        .add_source(Environment::default().source(Some(values)))
+        .build()
+}
+
+fn environment() -> Result<&'static Config> {
+    static CONFIG: OnceLock<Result<Config, String>> = OnceLock::new();
+    CONFIG
+        .get_or_init(|| {
+            // Load the application environment without retaining unrelated secrets.
+            let mut values = Map::new();
+            for (key, value) in env::vars_os() {
+                let Ok(key) = key.into_string() else { continue };
+                if !(matches!(
+                    key.as_str(),
+                    "PORT" | "OPENAI_MODEL" | "CHATGPT_ACCESS_TOKEN"
+                ) || key.starts_with("WREV_")
+                    && key.bytes().all(|byte| {
+                        byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+                    }))
+                {
+                    continue;
+                }
+                let value = value
+                    .into_string()
+                    .map_err(|_| format!("{key} is not valid Unicode"))?;
+                values.insert(key, value);
+            }
+            from_environment(values)
+                .map_err(|_| "Could not load environment configuration".to_owned())
+        })
+        .as_ref()
+        .map_err(|error| anyhow!("{error}"))
+}
+
+fn optional(settings: &Config, key: &str) -> Result<Option<String>> {
+    match settings.get_string(&key.to_ascii_lowercase()) {
+        Ok(value) => Ok(Some(value)),
+        Err(ConfigError::NotFound(_)) => Ok(None),
+        Err(_) => bail!("Invalid {key}"),
+    }
+}
+
 pub fn chatgpt_token() -> Result<String> {
-    match env::var("CHATGPT_ACCESS_TOKEN") {
-        Ok(token) => {
+    match optional(environment()?, "CHATGPT_ACCESS_TOKEN")? {
+        Some(token) => {
             ensure!(!token.trim().is_empty(), "CHATGPT_ACCESS_TOKEN is empty");
             Ok(token)
         }
-        Err(env::VarError::NotPresent) => crate::auth::access_token(),
-        Err(_) => bail!("CHATGPT_ACCESS_TOKEN is not valid Unicode"),
+        None => crate::auth::access_token(),
     }
 }
 
 pub fn required(key: &str) -> Result<String> {
-    let value = env::var(key).map_err(|error| anyhow::anyhow!("{key}: {error}"))?;
+    let value = optional(environment()?, key)?.with_context(|| format!("Set {key}"))?;
     ensure!(!value.trim().is_empty(), "{key} is empty");
     Ok(value)
 }
 
 fn setting<T: FromStr>(key: &str, default: T) -> Result<T> {
-    parse_setting(key, env::var(key), default)
+    setting_from(environment()?, key, default)
 }
 
-fn parse_setting<T: FromStr>(
-    key: &str,
-    value: std::result::Result<String, env::VarError>,
-    default: T,
-) -> Result<T> {
-    match value {
-        Ok(value) => value.parse().map_err(|_| anyhow::anyhow!("Invalid {key}")),
-        Err(env::VarError::NotPresent) => Ok(default),
-        Err(env::VarError::NotUnicode(_)) => bail!("{key} is not valid Unicode"),
+fn setting_from<T: FromStr>(settings: &Config, key: &str, default: T) -> Result<T> {
+    match optional(settings, key)? {
+        Some(value) => value.parse().map_err(|_| anyhow!("Invalid {key}")),
+        None => Ok(default),
     }
 }
 
@@ -144,19 +184,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uses_independent_overrides_and_rejects_invalid_values() {
+    fn uses_independent_overrides_and_rejects_invalid_values() -> Result<()> {
         let default = NonZeroU32::new(20).unwrap();
+        let settings = from_environment(Map::from([
+            ("WREV_OVERRIDE".to_owned(), "45".to_owned()),
+            ("WREV_ZERO".to_owned(), "0".to_owned()),
+            ("WREV_INVALID".to_owned(), "invalid".to_owned()),
+            ("PORT".to_owned(), "8081".to_owned()),
+            ("CHATGPT_ACCESS_TOKEN".to_owned(), "007".to_owned()),
+        ]))?;
+        assert_eq!(setting_from(&settings, "WREV_UNSET", default)?, default);
+        assert_eq!(setting_from(&settings, "WREV_OVERRIDE", default)?.get(), 45);
+        assert!(setting_from(&settings, "WREV_ZERO", default).is_err());
+        assert!(setting_from(&settings, "WREV_INVALID", default).is_err());
+        assert_eq!(setting_from(&settings, "PORT", 8080_u16)?, 8081);
         assert_eq!(
-            parse_setting("TEST", Err(env::VarError::NotPresent), default).unwrap(),
-            default
+            optional(&settings, "CHATGPT_ACCESS_TOKEN")?.as_deref(),
+            Some("007")
         );
-        assert_eq!(
-            parse_setting("TEST", Ok("45".into()), default)
-                .unwrap()
-                .get(),
-            45
-        );
-        assert!(parse_setting("TEST", Ok("0".into()), default).is_err());
-        assert!(parse_setting("TEST", Ok("invalid".into()), default).is_err());
+        Ok(())
     }
 }

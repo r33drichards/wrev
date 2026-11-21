@@ -46,7 +46,8 @@ reviewing private code.
 
 ## Deployment configuration
 
-Set each option independently in the process environment. Unset options use
+`wrev` loads deployment settings with the Rust `config` crate. Set each option
+independently in the process environment. Unset options use
 the defaults below. Timeouts and byte limits must be positive integers.
 Supply credentials through your deployment's secret store. See the
 [Twelve-Factor config guidance](https://12factor.net/config).
