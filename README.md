@@ -2,8 +2,10 @@
 
 wrev reviews GitHub pull requests labeled `wrev`. It runs the Minimal MCP Agent
 loop and embeds QuickJS. JavaScript gets three PR-scoped Rust tools backed by
-Octocrab. They read PR metadata, changed-file pages, and text files at the
-pinned base or head commit. The runner writes a JSON review to stdout.
+Octocrab. Use `pulls_get` for PR metadata, `pulls_list_files` for changed-file pages,
+and `repos_get_content` for Contents API data at the pinned base or head.
+The tools preserve GitHub response fields and leave pagination and decoding
+to the caller. The runner writes a JSON review to stdout.
 
 ## Run
 

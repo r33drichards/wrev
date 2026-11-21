@@ -1,8 +1,7 @@
 use anyhow::{Context, Result, anyhow, ensure};
-use base64::{Engine, engine::general_purpose::STANDARD};
 use hmac::{Hmac, Mac};
 use minimal_mcp_agent::{agent, quickjs_tools::QuickJsTools};
-use octocrab::Octocrab;
+use octocrab::{Octocrab, Page};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Sha256;
@@ -17,9 +16,6 @@ use tiny_http::{Method, Request, Response, Server, StatusCode};
 use tokio::runtime::Runtime;
 
 const LABEL: &str = "wrev";
-const FILES_PER_PAGE: usize = 10;
-const MAX_PAGE: u64 = 300;
-const MAX_FILE_BYTES: usize = 64 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -47,8 +43,6 @@ struct Ref {
 
 #[derive(Deserialize)]
 struct Pull {
-    title: String,
-    body: Option<String>,
     state: String,
     base: Ref,
     head: Ref,
@@ -67,15 +61,6 @@ struct PullEvent {
 #[derive(Deserialize)]
 struct EventPull {
     head: Ref,
-}
-
-#[derive(Deserialize)]
-struct FileContent {
-    #[serde(rename = "type")]
-    kind: String,
-    size: usize,
-    encoding: Option<String>,
-    content: Option<String>,
 }
 
 fn allowed_repo(name: &str) -> bool {
@@ -124,76 +109,75 @@ fn register_tools(client: &Octocrab, target: &Target, pull: &Pull) -> Result<Qui
     }
 
     let mut tools = QuickJsTools::default();
-    let context = json!({
-        "repository": target.repository, "number": target.number,
-        "title": pull.title, "body": pull.body,
-        "base": pull.base.sha, "head": pull.head.sha
-    });
-    tools.register_rust(
-        "pr_context",
-        "Read review identity and PR metadata",
+    let pull_route = format!("/repos/{}/pulls/{}", target.repository, target.number);
+    let files_route = format!("{pull_route}/files");
+    let pull_client = client.clone();
+    tools.register_async_rust(
+        "pulls_get",
+        "Get the pull request authorized for this review. Returns GitHub's JSON.",
         json!({"type":"object","additionalProperties":false}),
-        move |_| Ok(context.clone()),
+        move |_| {
+            let client = pull_client.clone();
+            let route = pull_route.clone();
+            async move { Ok(tokio::time::timeout(HTTP_TIMEOUT, client.get(route, None::<&()>)).await??) }
+        },
     )?;
 
-    let files_route = format!("/repos/{}/pulls/{}/files", target.repository, target.number);
     let files_client = client.clone();
     tools.register_async_rust(
-        "list_changed_files",
-        "Read one page of changed files and diff excerpts. Keep requesting pages until nextPage is null.",
-        json!({"type":"object","properties":{"page":{"type":"integer","minimum":1,"maximum":MAX_PAGE}},"required":["page"],"additionalProperties":false}),
+        "pulls_list_files",
+        "List files for the authorized pull request. Returns an Octocrab page with items and pagination links.",
+        json!({"type":"object","properties":{
+            "page":{"type":"integer","minimum":1},
+            "per_page":{"type":"integer","minimum":1,"maximum":100}
+        },"additionalProperties":false}),
         move |args| {
             let client = files_client.clone();
             let route = files_route.clone();
             async move {
-                let page = args.get("page").and_then(Value::as_u64).filter(|page| (1..=MAX_PAGE).contains(page)).context("Invalid page")?;
-                let files: Vec<Value> = tokio::time::timeout(
-                    HTTP_TIMEOUT,
-                    client.get(route, Some(&[("page", page), ("per_page", FILES_PER_PAGE as u64)])),
+                let mut query = Vec::new();
+                for (key, max) in [("page", u64::from(u32::MAX)), ("per_page", 100)] {
+                    if let Some(value) = args.get(key) {
+                        let value = value.as_u64().filter(|n| (1..=max).contains(n))
+                            .with_context(|| format!("Invalid {key}"))?;
+                        query.push((key, value));
+                    }
+                }
+                let page: Page<Value> = tokio::time::timeout(
+                    HTTP_TIMEOUT, client.get(route, Some(&query)),
                 ).await??;
-                let next = (files.len() == FILES_PER_PAGE && page < MAX_PAGE).then_some(page + 1);
-                let files: Vec<_> = files.into_iter().map(|file| {
-                    let patch = file["patch"].as_str();
-                    json!({
-                        "filename": file["filename"], "previousFilename": file["previous_filename"],
-                        "status": file["status"], "additions": file["additions"], "deletions": file["deletions"],
-                        "patch": patch.map(|text| text.chars().take(4000).collect::<String>()),
-                        "patchTruncated": patch.is_some_and(|text| text.chars().nth(4000).is_some()),
-                    })
-                }).collect();
-                Ok(json!({"files": files, "nextPage": next, "githubFileLimitReached": page == MAX_PAGE && files.len() == FILES_PER_PAGE}))
+                Ok(serde_json::to_value(page)?)
             }
         },
     )?;
 
     let file_client = client.clone();
-    let base = (target.repository.clone(), pull.base.sha.clone());
-    let head = head_repo.map(|repo| (repo, pull.head.sha.clone()));
+    let base = (
+        target.repository.to_ascii_lowercase(),
+        pull.base.sha.clone(),
+    );
+    let head = head_repo.map(|repo| (repo.to_ascii_lowercase(), pull.head.sha.clone()));
     tools.register_async_rust(
-        "read_file",
-        "Read a UTF-8 repository file at the verified base or head commit, up to 64 KiB",
-        json!({"type":"object","properties":{"side":{"enum":["base","head"]},"path":{"type":"string"}},"required":["side","path"],"additionalProperties":false}),
+        "repos_get_content",
+        "Get GitHub Contents API JSON for a path at one of this PR's pinned repository and commit pairs.",
+        json!({"type":"object","properties":{
+            "repository":{"type":"string"}, "ref":{"type":"string"}, "path":{"type":"string"}
+        },"required":["repository","ref","path"],"additionalProperties":false}),
         move |args| {
             let client = file_client.clone();
             let base = base.clone();
             let head = head.clone();
             async move {
-                let (repository, sha) = match args.get("side").and_then(Value::as_str) {
-                    Some("base") => base,
-                    Some("head") => head.context("Head repository is unavailable")?,
-                    _ => anyhow::bail!("Invalid side"),
-                };
+                let repository = args.get("repository").and_then(Value::as_str)
+                    .context("Missing repository")?.to_ascii_lowercase();
+                let reference = args.get("ref").and_then(Value::as_str).context("Missing ref")?;
                 let path = args.get("path").and_then(Value::as_str).context("Missing path")?;
-                let route = file_route(&repository, path)?;
-                let file: FileContent = tokio::time::timeout(
-                    HTTP_TIMEOUT, client.get(route, Some(&[("ref", sha)])),
-                ).await??;
-                ensure!(file.kind == "file" && file.size <= MAX_FILE_BYTES && file.encoding.as_deref() == Some("base64"), "File is unavailable or too large");
-                let encoded = file.content.context("Missing file contents")?;
-                let bytes = STANDARD.decode(encoded.lines().collect::<String>())?;
-                ensure!(bytes.len() <= MAX_FILE_BYTES, "File is too large");
-                let content = String::from_utf8(bytes)?;
-                Ok(json!({"path": path, "content": content}))
+                let pair = (repository, reference.to_owned());
+                ensure!(pair == base || head.as_ref() == Some(&pair), "Repository and ref are outside this review");
+                let route = file_route(&pair.0, path)?;
+                Ok(tokio::time::timeout(
+                    HTTP_TIMEOUT, client.get(route, Some(&[("ref", reference)])),
+                ).await??)
             }
         },
     )?;
@@ -482,6 +466,10 @@ mod tests {
         let endpoint = format!("http://{}", fixture.server_addr());
         let expected = [
             (
+                "/repos/acme/project/pulls/7".to_owned(),
+                json!({"title":"Review","custom":"kept"}),
+            ),
+            (
                 "/repos/acme/project/pulls/7/files?page=1&per_page=10".to_owned(),
                 json!([
                     {"filename":"src/new file.rs","status":"modified","patch":"+new text"}
@@ -489,7 +477,7 @@ mod tests {
             ),
             (
                 format!("/repos/contributor/fork/contents/src/new%20file.rs?ref={HEAD}"),
-                json!({"type":"file","size":8,"encoding":"base64","content":STANDARD.encode("new text")}),
+                json!({"type":"file","size":8,"encoding":"base64","content":"bmV3IHRleHQ="}),
             ),
         ];
         let worker = std::thread::spawn(move || {
@@ -504,9 +492,14 @@ mod tests {
                     header(&request, "Authorization").as_deref(),
                     Some("Bearer test-token")
                 );
-                request
-                    .respond(Response::from_string(response.to_string()))
-                    .unwrap();
+                let mut response = Response::from_string(response.to_string());
+                if path.contains("/files?") {
+                    response.add_header(tiny_http::Header::from_bytes(
+                        "Link",
+                        "<https://api.github.com/repos/acme/project/pulls/7/files?page=2&per_page=10>; rel=\"next\"",
+                    ).unwrap());
+                }
+                request.respond(response).unwrap();
             }
         });
         let runtime = Runtime::new()?;
@@ -531,15 +524,29 @@ mod tests {
         let script = r#"
             const tools = mcp.listTools("rust");
             if (tools.length !== 3) throw new Error("Unexpected capabilities");
-            const page = (await mcp.callTool("rust", "list_changed_files", {page:1})).structuredContent;
-            const file = await mcp.callTool("rust", "read_file", {side:"head", path:page.files[0].filename});
+            const pr = (await mcp.callTool("rust", "pulls_get", {})).structuredContent;
+            if (pr.custom !== "kept") throw new Error("PR response was projected");
+            const page = (await mcp.callTool("rust", "pulls_list_files", {page:1, per_page:10})).structuredContent;
+            if (!page.next.includes("page=2")) throw new Error("Missing GitHub pagination");
+            const file = await mcp.callTool("rust", "repos_get_content", {
+                repository:"contributor/fork", ref:"1111111111111111111111111111111111111111",
+                path:page.items[0].filename
+            });
             console.log(file.structuredContent.content);
         "#;
         let runtime = Runtime::new()?;
         let result =
             runtime.block_on(tools.call("run_js", &json!({"code":script}).to_string(), false));
         worker.join().expect("GitHub fixture");
-        assert_eq!(result?, json!("new text\n"));
+        assert_eq!(result?, json!("bmV3IHRleHQ=\n"));
+        let outside_scope = json!({"code": format!(
+            "await mcp.callTool('rust', 'repos_get_content', {{repository:'unrelated/repo', ref:'{HEAD}', path:'secret'}})"
+        )});
+        assert!(
+            runtime
+                .block_on(tools.call("run_js", &outside_scope.to_string(), false))
+                .is_err()
+        );
         assert!(file_route("acme/project", "../escape").is_err());
         Ok(())
     }
