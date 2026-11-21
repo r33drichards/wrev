@@ -16,9 +16,27 @@ use std::{
 };
 use tokio::time::{Instant, timeout_at};
 
-const TIME_LIMIT: Duration = Duration::from_secs(120);
-const MAX_CODE_BYTES: usize = 64 * 1024;
-const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+/// Resource limits applied to each JavaScript invocation.
+#[derive(Clone, Copy)]
+pub struct ScriptLimits {
+    pub timeout: Duration,
+    pub code_bytes: usize,
+    pub output_bytes: usize,
+    pub memory_bytes: usize,
+    pub stack_bytes: usize,
+}
+
+impl Default for ScriptLimits {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(120),
+            code_bytes: 64 * 1024,
+            output_bytes: 64 * 1024,
+            memory_bytes: 32 * 1024 * 1024,
+            stack_bytes: 256 * 1024,
+        }
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -41,11 +59,19 @@ const RUST_NAMESPACE: &str = "rust";
 /// Tool catalog and dispatch for the QuickJS backend.
 #[derive(Default)]
 pub struct QuickJsTools {
+    limits: ScriptLimits,
     catalog: Vec<Value>,
     handlers: Rc<BTreeMap<(String, String), ToolHandler>>,
 }
 
 impl QuickJsTools {
+    pub fn with_limits(limits: ScriptLimits) -> Self {
+        Self {
+            limits,
+            ..Self::default()
+        }
+    }
+
     /// Register a discovered MCP tool and the connection that serves it.
     pub fn register_mcp(
         &mut self,
@@ -161,17 +187,17 @@ impl QuickJsTools {
         ensure!(name == "run_js", "Unknown tool");
         let RunJs { code } = serde_json::from_str(arguments).context("Invalid run_js arguments")?;
         ensure!(
-            !code.trim().is_empty() && code.len() <= MAX_CODE_BYTES,
+            !code.trim().is_empty() && code.len() <= self.limits.code_bytes,
             "Invalid run_js code length"
         );
         if report {
             println!("Tool: run_js");
         }
 
-        let deadline = Instant::now() + TIME_LIMIT;
+        let deadline = Instant::now() + self.limits.timeout;
         let runtime = AsyncRuntime::new()?;
-        runtime.set_memory_limit(32 * 1024 * 1024).await;
-        runtime.set_max_stack_size(256 * 1024).await;
+        runtime.set_memory_limit(self.limits.memory_bytes).await;
+        runtime.set_max_stack_size(self.limits.stack_bytes).await;
         runtime
             .set_interrupt_handler(Some(Box::new(move || Instant::now() >= deadline)))
             .await;
@@ -180,6 +206,7 @@ impl QuickJsTools {
         let uncertain = Rc::new(Cell::new(false));
         let output = Rc::new(RefCell::new(String::new()));
         let handlers = self.handlers.clone();
+        let output_limit = self.limits.output_bytes;
         let run = context.async_with(async |ctx| -> Result<()> {
             let list = ctx.json_parse(serde_json::to_vec(&self.catalog)?)?;
             let pending_calls = pending.clone();
@@ -233,7 +260,7 @@ impl QuickJsTools {
             let captured_output = output.clone();
             let write = Func::from(move |line: String| -> rquickjs::Result<()> {
                 let mut output = captured_output.borrow_mut();
-                if line.len() >= MAX_OUTPUT_BYTES - output.len() {
+                if line.len() >= output_limit - output.len() {
                     return Err(js_error("Console output limit exceeded"));
                 }
                 output.push_str(&line);

@@ -80,7 +80,7 @@ fn challenge(verifier: &str) -> String {
 fn client() -> Result<Client> {
     Ok(Client::builder()
         .redirect(Policy::none())
-        .timeout(Duration::from_secs(30))
+        .timeout(crate::config::auth_timeout()?)
         .build()?)
 }
 fn store_dir() -> Result<PathBuf> {
@@ -325,11 +325,19 @@ fn parse_callback(target: &str, expected_state: &str) -> Result<HashMap<String, 
 }
 fn wait_callback(listener: TcpListener, state: &str) -> Result<HashMap<String, String>> {
     listener.set_nonblocking(true)?;
-    let deadline = Instant::now() + Duration::from_secs(300);
+    let settings = crate::config::OAuthCallbackConfig::from_env()?;
+    let deadline = Instant::now() + settings.timeout;
+    let read_timeout = settings.read_timeout;
     while Instant::now() < deadline {
         match listener.accept() {
             Ok((mut stream, _)) => {
-                stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                stream.set_read_timeout(Some(
+                    read_timeout.min(
+                        deadline
+                            .saturating_duration_since(Instant::now())
+                            .max(Duration::from_millis(1)),
+                    ),
+                ))?;
                 let mut line = String::new();
                 if BufReader::new((&stream).take(8192))
                     .read_line(&mut line)

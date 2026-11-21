@@ -1,15 +1,12 @@
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::Client;
 use serde_json::{Value, json};
-use std::{
-    io::{BufRead, BufReader},
-    time::Duration,
-};
+use std::io::{BufRead, BufReader};
 
 pub fn client() -> Result<Client> {
     Ok(Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(Duration::from_secs(180))
+        .timeout(crate::config::model_timeout()?)
         .build()?)
 }
 
@@ -29,8 +26,14 @@ pub fn models(token: &str) -> Result<Vec<Value>> {
         .collect())
 }
 
-pub fn prompt(token: &str, model: &str, messages: &[Value], tools: &[Value]) -> Result<Vec<Value>> {
-    let response = client()?
+pub fn prompt(
+    client: &Client,
+    token: &str,
+    model: &str,
+    messages: &[Value],
+    tools: &[Value],
+) -> Result<Vec<Value>> {
+    let response = client
         .post("https://api.openai.com/v1/responses")
         .bearer_auth(token)
         .json(&json!({"model": model, "input": messages,

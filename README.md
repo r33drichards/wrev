@@ -43,3 +43,33 @@ one at a time. Deduplication uses repository, PR number, and head SHA. The
 queue and deduplication state are in memory. Restarting the process clears
 both. Reviews go to stdout as JSON, so keep the runner's logs private when
 reviewing private code.
+
+## Deployment configuration
+
+Set each option independently in the process environment. Unset options use
+the defaults below. Timeouts and byte limits must be positive integers.
+Supply credentials through your deployment's secret store. See the
+[Twelve-Factor config guidance](https://12factor.net/config).
+
+| Variable | Default | Scope |
+| --- | ---: | --- |
+| `WREV_MODEL_TIMEOUT_SECS` | 180 | One model or model-catalog HTTP request |
+| `WREV_GITHUB_TIMEOUT_SECS` | 20 | One GitHub API request |
+| `WREV_SCRIPT_TIMEOUT_SECS` | 120 | One QuickJS invocation, including tool calls |
+| `WREV_SCRIPT_CODE_BYTES` | 65536 | JavaScript source per invocation |
+| `WREV_SCRIPT_OUTPUT_BYTES` | 65536 | Console output per invocation |
+| `WREV_SCRIPT_MEMORY_BYTES` | 33554432 | QuickJS heap limit |
+| `WREV_SCRIPT_STACK_BYTES` | 262144 | QuickJS stack limit |
+| `WREV_BIND_ADDR` | `0.0.0.0` | Listener IP address |
+| `PORT` | 8080 | Listener port |
+| `WREV_LABEL` | `wrev` | PR label that triggers a review |
+| `WREV_QUEUE_CAPACITY` | 16 | Queued webhook reviews |
+| `WREV_DEDUP_CAPACITY` | 4096 | Recently completed reviews kept for deduplication |
+| `WREV_WEBHOOK_BODY_BYTES` | 1048576 | Maximum webhook request body |
+| `WREV_AUTH_TIMEOUT_SECS` | 30 | One sign-in or credential refresh HTTP request |
+| `WREV_OAUTH_CALLBACK_TIMEOUT_SECS` | 300 | Time to complete the local browser sign-in |
+| `WREV_OAUTH_READ_TIMEOUT_SECS` | 2 | Reading the local sign-in callback |
+
+The listener also requires `WREV_REPOSITORIES` and `WREV_WEBHOOK_SECRET`.
+Both review modes require `OPENAI_MODEL` and `WREV_GITHUB_TOKEN`. Supply
+`CHATGPT_ACCESS_TOKEN` for noninteractive deployments.

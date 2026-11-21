@@ -1,3 +1,4 @@
+use crate::config::{self, ListenerConfig, ReviewConfig};
 use anyhow::{Context, Result, anyhow, ensure};
 use hmac::{Hmac, Mac};
 use minimal_mcp_agent::{agent, quickjs_tools::QuickJsTools};
@@ -14,9 +15,6 @@ use std::{
 };
 use tiny_http::{Method, Request, Response, Server, StatusCode};
 use tokio::runtime::Runtime;
-
-const LABEL: &str = "wrev";
-const HTTP_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct Target {
@@ -82,23 +80,27 @@ fn valid_sha(sha: &str) -> bool {
 
 fn authenticate(runtime: &Runtime) -> Result<Octocrab> {
     let _runtime = runtime.enter();
-    let token = env::var("WREV_GITHUB_TOKEN").context("Set WREV_GITHUB_TOKEN")?;
-    ensure!(!token.trim().is_empty(), "WREV_GITHUB_TOKEN is empty");
+    let token = config::required("WREV_GITHUB_TOKEN")?;
     Ok(Octocrab::builder().personal_token(token).build()?)
 }
 
-async fn pull(client: &Octocrab, repository: &str, number: u64) -> Result<Pull> {
+async fn pull(client: &Octocrab, repository: &str, number: u64, timeout: Duration) -> Result<Pull> {
     ensure!(
         allowed_repo(repository) && number > 0,
         "Invalid pull request identity"
     );
     let route = format!("/repos/{repository}/pulls/{number}");
-    tokio::time::timeout(HTTP_TIMEOUT, client.get(route, None::<&()>))
+    tokio::time::timeout(timeout, client.get(route, None::<&()>))
         .await?
         .context("Read pull request")
 }
 
-fn register_tools(client: &Octocrab, target: &Target, pull: &Pull) -> Result<QuickJsTools> {
+fn register_tools(
+    client: &Octocrab,
+    target: &Target,
+    pull: &Pull,
+    settings: &ReviewConfig,
+) -> Result<QuickJsTools> {
     ensure!(
         valid_sha(&pull.base.sha) && valid_sha(&pull.head.sha),
         "Invalid PR commit SHA"
@@ -108,7 +110,8 @@ fn register_tools(client: &Octocrab, target: &Target, pull: &Pull) -> Result<Qui
         ensure!(allowed_repo(repo), "Invalid head repository");
     }
 
-    let mut tools = QuickJsTools::default();
+    let mut tools = QuickJsTools::with_limits(settings.script);
+    let timeout = settings.github_timeout;
     let pull_route = format!("/repos/{}/pulls/{}", target.repository, target.number);
     let files_route = format!("{pull_route}/files");
     let pull_client = client.clone();
@@ -119,7 +122,7 @@ fn register_tools(client: &Octocrab, target: &Target, pull: &Pull) -> Result<Qui
         move |_| {
             let client = pull_client.clone();
             let route = pull_route.clone();
-            async move { Ok(tokio::time::timeout(HTTP_TIMEOUT, client.get(route, None::<&()>)).await??) }
+            async move { Ok(tokio::time::timeout(timeout, client.get(route, None::<&()>)).await??) }
         },
     )?;
 
@@ -144,7 +147,7 @@ fn register_tools(client: &Octocrab, target: &Target, pull: &Pull) -> Result<Qui
                     }
                 }
                 let page: Page<Value> = tokio::time::timeout(
-                    HTTP_TIMEOUT, client.get(route, Some(&query)),
+                    timeout, client.get(route, Some(&query)),
                 ).await??;
                 Ok(serde_json::to_value(page)?)
             }
@@ -176,7 +179,7 @@ fn register_tools(client: &Octocrab, target: &Target, pull: &Pull) -> Result<Qui
                 ensure!(pair == base || head.as_ref() == Some(&pair), "Repository and ref are outside this review");
                 let route = file_route(&pair.0, path)?;
                 Ok(tokio::time::timeout(
-                    HTTP_TIMEOUT, client.get(route, Some(&[("ref", reference)])),
+                    timeout, client.get(route, Some(&[("ref", reference)])),
                 ).await??)
             }
         },
@@ -204,29 +207,44 @@ fn file_route(repository: &str, path: &str) -> Result<String> {
 fn run_review(
     runtime: &Runtime,
     client: &Octocrab,
-    model_name: &str,
+    settings: &ReviewConfig,
+    model_client: &reqwest::blocking::Client,
     target: &Target,
-    require_label: bool,
+    required_label: Option<&str>,
 ) -> Result<()> {
-    let pr = runtime.block_on(pull(client, &target.repository, target.number))?;
+    let pr = runtime.block_on(pull(
+        client,
+        &target.repository,
+        target.number,
+        settings.github_timeout,
+    ))?;
     let eligible = |pr: &Pull| {
         pr.state == "open"
             && pr.head.sha == target.head
-            && (!require_label || pr.labels.iter().any(|label| label.name == LABEL))
+            && required_label
+                .is_none_or(|required| pr.labels.iter().any(|label| label.name == required))
     };
     ensure!(
         eligible(&pr),
         "Pull request is closed, changed, or no longer labeled"
     );
-    let tools = register_tools(client, target, &pr)?;
+    let tools = register_tools(client, target, &pr, settings)?;
     let definitions = QuickJsTools::definitions();
-    let token = crate::config::chatgpt_token()?;
+    let token = config::chatgpt_token()?;
     let mut messages = Vec::new();
     agent::run_turn(
         &mut messages,
         include_str!("review_prompt.md"),
         None,
-        |messages| crate::model::prompt(&token, model_name, messages, &definitions),
+        |messages| {
+            crate::model::prompt(
+                model_client,
+                &token,
+                &settings.model,
+                messages,
+                &definitions,
+            )
+        },
         |name, args| runtime.block_on(tools.call(name, args, false)),
         |_| {},
     )?;
@@ -248,7 +266,12 @@ fn run_review(
             (!text.trim().is_empty()).then_some(text)
         })
         .context("Model returned no final review")?;
-    let final_pr = runtime.block_on(pull(client, &target.repository, target.number))?;
+    let final_pr = runtime.block_on(pull(
+        client,
+        &target.repository,
+        target.number,
+        settings.github_timeout,
+    ))?;
     ensure!(
         eligible(&final_pr) && final_pr.base.sha == pr.base.sha,
         "Pull request changed during review"
@@ -270,18 +293,19 @@ pub fn manual() -> Result<()> {
     ensure!(args.next().is_none(), "Unexpected arguments");
     let runtime = Runtime::new()?;
     let client = authenticate(&runtime)?;
-    let current = runtime.block_on(pull(&client, &repository, number))?;
-    let model = env::var("OPENAI_MODEL").context("Set OPENAI_MODEL")?;
+    let settings = ReviewConfig::from_env()?;
+    let current = runtime.block_on(pull(&client, &repository, number, settings.github_timeout))?;
     run_review(
         &runtime,
         &client,
-        &model,
+        &settings,
+        &crate::model::client()?,
         &Target {
             repository,
             number,
             head: current.head.sha,
         },
-        false,
+        None,
     )
 }
 
@@ -309,10 +333,16 @@ fn signed(secret: &[u8], signature: &str, body: &[u8]) -> bool {
     mac.verify_slice(&bytes).is_ok()
 }
 
-fn labeled_target(body: &[u8], repositories: &HashSet<String>) -> Result<Option<Target>> {
+fn labeled_target(
+    body: &[u8],
+    repositories: &HashSet<String>,
+    expected_label: &str,
+) -> Result<Option<Target>> {
     let event: PullEvent = serde_json::from_slice(body)?;
     if event.action != "labeled"
-        || !event.label.is_some_and(|label| label.name == LABEL)
+        || !event
+            .label
+            .is_some_and(|label| label.name == expected_label)
         || !repositories.contains(&event.repository.full_name.to_ascii_lowercase())
     {
         return Ok(None);
@@ -329,10 +359,8 @@ fn labeled_target(body: &[u8], repositories: &HashSet<String>) -> Result<Option<
 }
 
 pub fn listen() -> Result<()> {
-    let secret = env::var("WREV_WEBHOOK_SECRET").context("Set WREV_WEBHOOK_SECRET")?;
-    ensure!(!secret.trim().is_empty(), "WREV_WEBHOOK_SECRET is empty");
-    let repositories: HashSet<_> = env::var("WREV_REPOSITORIES")
-        .context("Set WREV_REPOSITORIES")?
+    let secret = config::required("WREV_WEBHOOK_SECRET")?;
+    let repositories: HashSet<_> = config::required("WREV_REPOSITORIES")?
         .split(',')
         .map(|name| name.trim().to_ascii_lowercase())
         .collect();
@@ -342,22 +370,31 @@ pub fn listen() -> Result<()> {
     );
     let runtime = Runtime::new()?;
     let client = authenticate(&runtime)?;
-    let model = env::var("OPENAI_MODEL").context("Set OPENAI_MODEL")?;
-    let port: u16 = env::var("PORT")
-        .unwrap_or_else(|_| "8080".to_owned())
-        .parse()?;
-    let server = Server::http(("0.0.0.0", port)).map_err(|error| anyhow!("{error}"))?;
-    let (queue, work) = mpsc::sync_channel::<Target>(16);
+    let settings = ReviewConfig::from_env()?;
+    let model_client = crate::model::client()?;
+    let listener = ListenerConfig::from_env()?;
+    let server =
+        Server::http((listener.bind, listener.port)).map_err(|error| anyhow!("{error}"))?;
+    let (queue, work) = mpsc::sync_channel::<Target>(listener.queue_capacity);
+    let worker_label = listener.label.clone();
+    let dedup_capacity = listener.dedup_capacity;
     let seen = Arc::new(Mutex::new(HashSet::new()));
     let worker_seen = Arc::clone(&seen);
     std::thread::spawn(move || {
         let mut completed = VecDeque::new();
         for target in work {
-            let result = run_review(&runtime, &client, &model, &target, true);
+            let result = run_review(
+                &runtime,
+                &client,
+                &settings,
+                &model_client,
+                &target,
+                Some(&worker_label),
+            );
             let mut seen = worker_seen.lock().expect("review state");
             if result.is_ok() {
                 completed.push_back(target);
-                if completed.len() > 4096
+                if completed.len() > dedup_capacity
                     && let Some(old) = completed.pop_front()
                 {
                     seen.remove(&old);
@@ -376,6 +413,7 @@ pub fn listen() -> Result<()> {
                 &mut request,
                 secret.as_bytes(),
                 &repositories,
+                &listener,
                 &queue,
                 &seen,
             ),
@@ -390,6 +428,7 @@ fn webhook_status(
     request: &mut Request,
     secret: &[u8],
     repositories: &HashSet<String>,
+    listener: &ListenerConfig,
     queue: &mpsc::SyncSender<Target>,
     seen: &Mutex<HashSet<Target>>,
 ) -> u16 {
@@ -400,10 +439,10 @@ fn webhook_status(
     let mut body = Vec::new();
     if request
         .as_reader()
-        .take(1024 * 1024 + 1)
+        .take((listener.body_bytes as u64).saturating_add(1))
         .read_to_end(&mut body)
         .is_err()
-        || body.len() > 1024 * 1024
+        || body.len() > listener.body_bytes
     {
         return 413;
     }
@@ -413,7 +452,7 @@ fn webhook_status(
     if event.as_deref() != Some("pull_request") {
         return 204;
     }
-    let target = match labeled_target(&body, repositories) {
+    let target = match labeled_target(&body, repositories, &listener.label) {
         Ok(Some(target)) => target,
         Ok(None) => return 204,
         Err(_) => return 400,
@@ -453,10 +492,10 @@ mod tests {
         let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
         assert!(signed(secret, &signature, &body));
         assert!(!signed(secret, &signature, b"tampered"));
-        assert_eq!(labeled_target(&body, &repo)?.unwrap().head, HEAD);
-        assert!(labeled_target(&body, &HashSet::new())?.is_none());
+        assert_eq!(labeled_target(&body, &repo, "wrev")?.unwrap().head, HEAD);
+        assert!(labeled_target(&body, &HashSet::new(), "wrev")?.is_none());
         event["label"]["name"] = json!("wreview");
-        assert!(labeled_target(&serde_json::to_vec(&event)?, &repo)?.is_none());
+        assert!(labeled_target(&serde_json::to_vec(&event)?, &repo, "wrev")?.is_none());
         Ok(())
     }
 
@@ -520,7 +559,12 @@ mod tests {
             "base":{"sha":BASE},
             "head":{"sha":HEAD,"repo":{"full_name":"contributor/fork"}}
         }))?;
-        let tools = register_tools(&client, &target, &pr)?;
+        let settings = ReviewConfig {
+            model: "fixture".into(),
+            github_timeout: Duration::from_secs(5),
+            script: Default::default(),
+        };
+        let tools = register_tools(&client, &target, &pr, &settings)?;
         let script = r#"
             const tools = mcp.listTools("rust");
             if (tools.length !== 3) throw new Error("Unexpected capabilities");
