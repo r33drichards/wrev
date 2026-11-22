@@ -138,6 +138,30 @@ for the reviewer setup and metric definitions.
 | False positives (% of submissions) | **81 (24.5%)** | 61 (29.2%) |
 | Novel true positives | **79** | 39 |
 
+### Resource usage sample
+
+A separate run measured three matched PRs with GPT-6 Luna, one review at a time.
+The table shows per-task averages for that sample.
+
+| Average per task | Wrev | Codex CLI |
+| --- | ---: | ---: |
+| Elapsed review time | 19.68 s | 31.13 s |
+| CPU time | 0.48 s | 11.75 s |
+| Peak measured memory | 15.9 MiB | 340.4 MiB |
+| Input tokens | 35,516 | 77,833 |
+| Cached input tokens | 2,944 | 55,637 |
+| Estimated model cost | $0.00358 | $0.00327 |
+
+Elapsed time covers reviewer invocation through output, excluding checkout
+preparation and Terra scoring. Wrev ran natively on macOS and reports peak
+resident memory. Codex ran in a Linux container and reports the container's
+peak memory, including filesystem cache. CPU time is measured for each
+reviewer's respective runtime.
+
+Model cost is a Standard API equivalent based on recorded input, cached
+input, and output tokens. The runs used ChatGPT sign-in, so the figures
+are estimates of equivalent API usage. [GPT-6 Luna pricing](https://developers.openai.com/api/docs/models/gpt-6-luna)
+
 ## Configuration
 
 Set `OPENAI_MODEL` for reviews. Native `review` and `prepare-review` use
