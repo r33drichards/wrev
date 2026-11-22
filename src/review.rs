@@ -267,23 +267,48 @@ fn run_review(
     );
     let tools = register_tools(client, target, &pr, settings)?;
     let definitions = QuickJsTools::definitions();
+    let prompt = |messages: &[Value]| {
+        crate::model::prompt(
+            model_client,
+            &access_token()?,
+            &settings.model,
+            messages,
+            &definitions,
+        )
+    };
+    let tool = |name: &str, args: &str| runtime.block_on(tools.call(name, args, false));
+    let input = include_str!("review_prompt.md");
     let mut messages = Vec::new();
-    agent::run_turn(
-        &mut messages,
-        include_str!("review_prompt.md"),
-        None,
-        |messages| {
-            crate::model::prompt(
-                model_client,
-                &access_token()?,
-                &settings.model,
-                messages,
-                &definitions,
-            )
-        },
-        |name, args| runtime.block_on(tools.call(name, args, false)),
-        |_| {},
-    )?;
+    #[cfg(feature = "sqlite-backend")]
+    if let Some(dir) = env::var_os("WREV_SESSION_DIR") {
+        use minimal_mcp_agent::durable::{Turn, run_durable_turn};
+        use minimal_mcp_agent::durable_sqlite::SqliteBackend;
+        let backend = SqliteBackend::new(std::path::PathBuf::from(dir));
+        let identity = format!(
+            "{}#{}:{}:{}",
+            target.repository, target.number, target.head, pr.base.sha
+        );
+        messages = run_durable_turn(
+            &backend,
+            Turn {
+                session_id: &identity,
+                request_id: "review",
+                input,
+                max_rounds: usize::MAX,
+            },
+            prompt,
+            |name, args| {
+                Ok(tool(name, args)
+                    .unwrap_or_else(|err| json!({"isError":true,"error":err.to_string()})))
+            },
+            |_| {},
+            &mut |_, _: &agent::Checkpoint| Ok(()),
+        )?;
+    } else {
+        agent::run_turn(&mut messages, input, None, prompt, tool, |_| {})?;
+    }
+    #[cfg(not(feature = "sqlite-backend"))]
+    agent::run_turn(&mut messages, input, None, prompt, tool, |_| {})?;
     let review = messages
         .iter()
         .rev()
@@ -334,6 +359,14 @@ pub fn manual() -> Result<()> {
     let client = authenticate(&runtime)?;
     let settings = ReviewConfig::from_env()?;
     let current = runtime.block_on(pull(&client, &repository, number, settings.github_timeout))?;
+    let expected_head = env::var("WREV_EXPECTED_HEAD").ok();
+    if let Some(head) = &expected_head {
+        ensure!(
+            valid_sha(head) && current.head.sha == *head,
+            "Pull request head changed before review"
+        );
+    }
+    let required_label = env::var("WREV_REQUIRED_LABEL").ok();
     let review = run_review(
         &runtime,
         &client,
@@ -344,7 +377,7 @@ pub fn manual() -> Result<()> {
             number,
             head: current.head.sha,
         },
-        None,
+        required_label.as_deref(),
         config::chatgpt_token,
     )?;
     println!("{review}");

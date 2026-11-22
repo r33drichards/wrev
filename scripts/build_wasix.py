@@ -103,6 +103,8 @@ serde_urlencoded = "0.7"
 """
 assert manifest.count(preview2) == 1
 manifest = manifest.replace(preview2, '')
+manifest = manifest.replace('sqlite-backend = ["dep:rusqlite"]', 'sqlite-backend = []')
+manifest = manifest.replace('rusqlite = { version = "0.37", features = ["bundled"], optional = true }\n', '')
 old = 'reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "form"] }'
 new = 'reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }'
 assert old in manifest
