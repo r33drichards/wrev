@@ -8,6 +8,8 @@ use serde_json::{Value, json};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Event {
     TurnStarted,
+    /// Runs before model or tool effects on both fresh and resumed turns.
+    TurnPreparing,
     ModelStarted,
     ModelOutput,
     ToolStarted,
@@ -90,6 +92,9 @@ fn run_with_round_limit(
     mut print_text: impl FnMut(&str),
     hook: &mut dyn LifecycleHook,
 ) -> Result<()> {
+    if state.phase != Phase::Completed {
+        hook.on_event(Event::TurnPreparing, state)?;
+    }
     loop {
         match state.phase {
             Phase::Completed => return Ok(()),
@@ -191,8 +196,28 @@ pub fn run_turn(
     input: &str,
     max_rounds: impl Into<Option<usize>>,
     prompt_llm: impl FnMut(&[Value]) -> Result<Vec<Value>>,
+    call_tool: impl FnMut(&str, &str) -> Result<Value>,
+    print_text: impl FnMut(&str),
+) -> Result<()> {
+    run_turn_with_hooks(
+        messages,
+        input,
+        max_rounds,
+        prompt_llm,
+        call_tool,
+        print_text,
+        &mut |_: Event, _: &Checkpoint| Ok(()),
+    )
+}
+
+pub fn run_turn_with_hooks(
+    messages: &mut Vec<Value>,
+    input: &str,
+    max_rounds: impl Into<Option<usize>>,
+    prompt_llm: impl FnMut(&[Value]) -> Result<Vec<Value>>,
     mut call_tool: impl FnMut(&str, &str) -> Result<Value>,
     print_text: impl FnMut(&str),
+    hook: &mut dyn LifecycleHook,
 ) -> Result<()> {
     let limit = max_rounds.into();
     let mut state = Checkpoint::new(
@@ -201,7 +226,6 @@ pub fn run_turn(
         messages.clone(),
         limit.unwrap_or_default(),
     );
-    let mut hook = |_: Event, _: &Checkpoint| Ok(());
     hook.on_event(Event::TurnStarted, &state)?;
     let result = run_with_round_limit(
         &mut state,
@@ -214,7 +238,7 @@ pub fn run_turn(
             })
         },
         print_text,
-        &mut hook,
+        hook,
     );
     *messages = state.messages;
     result

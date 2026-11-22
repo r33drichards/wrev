@@ -12,7 +12,6 @@ request() {
     --env "PATH_INFO=$path" \
     --env WREV_WEBHOOK_SECRET=fixture-signing-key \
     --env WREV_REPOSITORIES=fixture/wrev \
-    --env WREV_GITHUB_TOKEN=fixture-github-token \
     --env OPENAI_MODEL=fixture-model \
     "$@" -- wcgi
 }

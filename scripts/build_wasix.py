@@ -98,11 +98,16 @@ manifest = (PROJECT / 'Cargo.toml').read_text()
 # Omit the separate Preview 2 command's dependencies from its lockfile.
 preview2 = """[target.'cfg(all(target_os = "wasi", target_env = "p2"))'.dependencies]
 wasi = "0.14"
-serde_urlencoded = "0.7"
 
 """
 assert manifest.count(preview2) == 1
 manifest = manifest.replace(preview2, '')
+native = """[target.'cfg(not(target_os = "wasi"))'.dependencies]
+tempfile = "3"
+
+"""
+assert manifest.count(native) == 1
+manifest = manifest.replace(native, '')
 manifest = manifest.replace('sqlite-backend = ["dep:rusqlite"]', 'sqlite-backend = []')
 manifest = manifest.replace('rusqlite = { version = "0.37", features = ["bundled"], optional = true }\n', '')
 old = 'reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "form"] }'
