@@ -30,6 +30,14 @@ into a temporary repository and uses the same read-only tools as
 from the pull request. Set `WREV_SESSION_DIR` and build with
 `--features sqlite-backend` to persist checkpoints.
 
+## Production updates
+
+Pushes to `main` run a serialized workflow that opens or updates a PR in
+`r33drichards/webhook` with the latest merged Wrev SHA. The workflow reads
+`WREV_WORKER_TOKEN` from this repository's Actions secrets. Scope that token
+to `r33drichards/webhook` with Contents and Pull requests write access.
+Merging the worker PR triggers Railway's production build from `master`.
+
 ## ReviewBench results
 
 Wrev and the Codex CLI each reviewed the same 219 frozen pull requests from the
