@@ -338,9 +338,7 @@ fn labeled_target(
 ) -> Result<Option<Target>> {
     let event: PullEvent = serde_json::from_slice(body)?;
     if event.action != "labeled"
-        || !event
-            .label
-            .is_some_and(|label| label.name == expected_label)
+        || event.label.is_none_or(|label| label.name != expected_label)
         || !repositories.contains(&event.repository.full_name.to_ascii_lowercase())
     {
         return Ok(None);
