@@ -145,24 +145,26 @@ Wrev used debug builds on macOS. The Wasmtime 39.0.1 runs used WASI Preview 2
 with the compiled-module cache disabled for cold runs and populated for warm
 runs. Elapsed times exclude checkout and snapshot preparation and Terra scoring.
 
-| Average per task | Wrev native | Wrev Wasmtime cold | Wrev Wasmtime warm | Codex CLI command |
-| --- | ---: | ---: | ---: | ---: |
-| Elapsed review time | 19.68 s | 21.92 s | 18.75 s | 24.68 s |
-| CPU time | 0.48 s | 3.62 s | 0.41 s | 9.52 s |
-| Peak RSS | 15.9 MiB | 170.3 MiB | 71.3 MiB | 385.3 MiB |
-| Input tokens | 35,516 | 42,859 | 38,386 | 80,442 |
-| Cached input tokens | 2,944 | 6,528 | 1,920 | 64,683 |
-| Estimated model cost | $0.00358 | $0.00398 | $0.00395 | $0.00260 |
+| Average per task | Wrev native | Wrev Wasmtime cold | Wrev Wasmtime warm | Codex CLI native | Codex CLI in Docker |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Elapsed review time | 19.68 s | 21.92 s | 18.75 s | 12.67 s | 24.68 s |
+| CPU time | 0.48 s | 3.62 s | 0.41 s | 2.86 s | 9.52 s |
+| Peak RSS | 15.9 MiB | 170.3 MiB | 71.3 MiB | 285.7 MiB | 385.3 MiB |
+| Input tokens | 35,516 | 42,859 | 38,386 | 34,202 | 80,442 |
+| Cached input tokens | 2,944 | 6,528 | 1,920 | 22,229 | 64,683 |
+| Estimated model cost | $0.00358 | $0.00398 | $0.00395 | $0.00157 | $0.00260 |
 
-Codex CLI ran in an amd64 Linux container on the arm64 Mac. The table times the
-review command and its subprocesses with GNU time, excluding the adapter's
-sign-in check and Docker startup. Its RSS is the largest resident-set peak
-reported for that command. The full container averaged
-**26.47 s elapsed**, **11.16 s CPU**, and
-**339.4 MiB peak cgroup memory**. About
-**1.64 CPU seconds** per review were spent
-outside the Codex command inside the container, including the adapter and
-sign-in check.
+Both Codex runs used CLI v0.159.3. Native Codex ran on arm64 macOS with the
+read-only sandbox, timed with macOS `time`. The Docker run used an amd64
+Linux container on the same Mac. GNU time measured the review command and
+its subprocesses, excluding the adapter's sign-in check and Docker startup.
+The native and containerized runs differ in architecture, sandboxing, and
+model traces, so the timing gap measures the two setups end to end.
+
+The full Codex container averaged **26.47 s elapsed**, **11.16 s CPU**, and
+**339.4 MiB peak cgroup memory**. About **1.64 CPU seconds** per review were
+spent outside the Codex command inside the container, including the adapter
+and sign-in check.
 
 An empty container using the same image averaged **0.19 s from
 launch through exit**, **0.05 s guest CPU**, and **3.6 MiB
