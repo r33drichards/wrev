@@ -145,11 +145,13 @@ impl ReviewConfig {
     }
 }
 
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
 pub struct WebhookConfig {
     pub label: String,
     pub body_bytes: usize,
 }
 
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
 impl WebhookConfig {
     pub fn from_env() -> Result<Self> {
         let label = setting("WREV_LABEL", String::from("wrev"))?;

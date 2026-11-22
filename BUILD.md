@@ -1,4 +1,25 @@
-# Build and deploy wrev on Wasmer
+# Build and deploy wrev
+
+## Wasmtime
+
+Install [Wasmtime 51](https://docs.wasmtime.dev/cli-install.html) and the Rust
+WASI Preview 2 target. The QuickJS build obtains WASI SDK automatically. Set
+`WASI_SDK` to an existing SDK directory to use a local installation.
+
+```sh
+rustup target add wasm32-wasip2
+cargo build --locked --release --target wasm32-wasip2 --bin wrev
+wasmtime run -S http \
+  --env OPENAI_MODEL --env WREV_GITHUB_TOKEN --env CHATGPT_ACCESS_TOKEN \
+  target/wasm32-wasip2/release/wrev.wasm review OWNER/REPO PR_NUMBER
+```
+
+The component connects to GitHub and OpenAI through WASI HTTP. Use the
+native CLI for browser login and the existing WCGI deployment below for
+the built-in webhook endpoint and MySQL credential store. For webhook integration, point the
+webhook server at the component and use its Wasmtime executor.
+
+## Existing Wasmer deployment
 
 The WASIX build packages the `wrev` binary with embedded QuickJS-NG. Use
 Wasmer 7.5.0, cargo-wasix 0.1.34, and WASI SDK 34. Install cargo-wasix and

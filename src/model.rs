@@ -1,8 +1,12 @@
 use anyhow::{Context, Result, bail};
-use reqwest::blocking::Client;
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
+pub use reqwest::blocking::Client;
+#[cfg(all(target_os = "wasi", target_env = "p2"))]
+pub type Client = std::time::Duration;
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader};
 
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
 pub fn client() -> Result<Client> {
     Ok(Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -10,13 +14,29 @@ pub fn client() -> Result<Client> {
         .build()?)
 }
 
+#[cfg(all(target_os = "wasi", target_env = "p2"))]
+pub fn client() -> Result<Client> {
+    crate::config::model_timeout()
+}
+
 pub fn models(token: &str) -> Result<Vec<Value>> {
+    #[cfg(not(all(target_os = "wasi", target_env = "p2")))]
     let response = client()?
         .get("https://api.openai.com/v1/models")
         .bearer_auth(token)
         .send()?
         .error_for_status()?;
+    #[cfg(not(all(target_os = "wasi", target_env = "p2")))]
     let value: Value = response.json()?;
+    #[cfg(all(target_os = "wasi", target_env = "p2"))]
+    let value: Value = serde_json::from_reader(BufReader::new(crate::wasi_http::request(
+        wasi::http::types::Method::Get,
+        "api.openai.com",
+        "/v1/models",
+        token,
+        None,
+        client()?,
+    )?))?;
     Ok(value["models"]
         .as_array()
         .context("Missing models catalog")?
@@ -33,14 +53,25 @@ pub fn prompt(
     messages: &[Value],
     tools: &[Value],
 ) -> Result<Vec<Value>> {
+    let body = json!({"model": model, "input": messages,
+        "tools": tools, "store": false, "stream": true,
+        "include": ["reasoning.encrypted_content"]});
+    #[cfg(not(all(target_os = "wasi", target_env = "p2")))]
     let response = client
         .post("https://api.openai.com/v1/responses")
         .bearer_auth(token)
-        .json(&json!({"model": model, "input": messages,
-            "tools": tools, "store": false, "stream": true,
-            "include": ["reasoning.encrypted_content"]}))
+        .json(&body)
         .send()?
         .error_for_status()?;
+    #[cfg(all(target_os = "wasi", target_env = "p2"))]
+    let response = crate::wasi_http::request(
+        wasi::http::types::Method::Post,
+        "api.openai.com",
+        "/v1/responses",
+        token,
+        Some(&serde_json::to_vec(&body)?),
+        *client,
+    )?;
     read_completed(BufReader::new(response))
 }
 

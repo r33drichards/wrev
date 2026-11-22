@@ -13,3 +13,21 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
+
+  wasmtime:
+    runs-on: ubuntu-24.04
+    env:
+      CARGO_TARGET_WASM32_WASIP2_RUNNER: wasmtime run
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-wasip2
+      - name: Install Wasmtime
+        run: |
+          curl -fsSL --retry 3 https://github.com/bytecodealliance/wasmtime/releases/download/v51.0.0/wasmtime-v51.0.0-x86_64-linux.tar.xz |
+            tar -xJ -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/wasmtime-v51.0.0-x86_64-linux" >> "$GITHUB_PATH"
+      - run: cargo test --locked --target wasm32-wasip2 --lib
+      - run: cargo build --locked --target wasm32-wasip2 --bin wrev
+      - run: wasmtime run -S http target/wasm32-wasip2/debug/wrev.wasm --help
