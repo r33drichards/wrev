@@ -141,26 +141,37 @@ for the reviewer setup and metric definitions.
 ### Resource usage sample
 
 A separate run measured three matched PRs with GPT-6 Luna, one review at a time.
-The table shows per-task averages for that sample.
+Wrev used debug builds on macOS. The Wasmtime 39.0.1 runs used WASI Preview 2
+with the compiled-module cache disabled for cold runs and populated for warm
+runs. Elapsed times exclude checkout and snapshot preparation and Terra scoring.
 
-| Average per task | Wrev | Codex CLI |
-| --- | ---: | ---: |
-| Elapsed review time | 19.68 s | 31.13 s |
-| CPU time | 0.48 s | 11.75 s |
-| Peak measured memory | 15.9 MiB | 340.4 MiB |
-| Input tokens | 35,516 | 77,833 |
-| Cached input tokens | 2,944 | 55,637 |
-| Estimated model cost | $0.00358 | $0.00327 |
+| Average per task | Wrev native | Wrev Wasmtime cold | Wrev Wasmtime warm | Codex CLI command |
+| --- | ---: | ---: | ---: | ---: |
+| Elapsed review time | 19.68 s | 21.92 s | 18.75 s | 24.68 s |
+| CPU time | 0.48 s | 3.62 s | 0.41 s | 9.52 s |
+| Peak RSS | 15.9 MiB | 170.3 MiB | 71.3 MiB | 385.3 MiB |
+| Input tokens | 35,516 | 42,859 | 38,386 | 80,442 |
+| Cached input tokens | 2,944 | 6,528 | 1,920 | 64,683 |
+| Estimated model cost | $0.00358 | $0.00398 | $0.00395 | $0.00260 |
 
-Elapsed time covers reviewer invocation through output, excluding checkout
-preparation and Terra scoring. Wrev ran natively on macOS and reports peak
-resident memory. Codex ran in a Linux container and reports the container's
-peak memory, including filesystem cache. CPU time is measured for each
-reviewer's respective runtime.
+Codex CLI ran in an amd64 Linux container on the arm64 Mac. The table times the
+review command and its subprocesses with GNU time, excluding the adapter's
+sign-in check and Docker startup. Its RSS is the largest resident-set peak
+reported for that command. The full container averaged
+**26.47 s elapsed**, **11.16 s CPU**, and
+**339.4 MiB peak cgroup memory**. About
+**1.64 CPU seconds** per review were spent
+outside the Codex command inside the container, including the adapter and
+sign-in check.
 
-Model cost is a Standard API equivalent based on recorded input, cached
-input, and output tokens. The runs used ChatGPT sign-in, so the figures
-are estimates of equivalent API usage. [GPT-6 Luna pricing](https://developers.openai.com/api/docs/models/gpt-6-luna)
+An empty container using the same image averaged **0.19 s from
+launch through exit**, **0.05 s guest CPU**, and **3.6 MiB
+peak cgroup memory**. Guest CPU measurements exclude the Docker VM host
+process. RSS and cgroup memory use different accounting, so subtracting their
+peaks would not isolate Docker's memory overhead.
+
+Model cost is a Standard API equivalent from recorded input, cached input,
+and output tokens. The reviews used ChatGPT sign-in. [GPT-6 Luna pricing](https://developers.openai.com/api/docs/models/gpt-6-luna)
 
 ## Configuration
 
