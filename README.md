@@ -1,42 +1,114 @@
-# wrev
+# Wrev
 
-wrev reviews GitHub pull requests labeled `wrev`. It runs the Minimal MCP Agent
-loop and embeds QuickJS. JavaScript gets three PR-scoped Rust tools backed by
-Octocrab. Use `pulls_get` for PR metadata, `pulls_list_files` for changed-file pages,
-and `repos_get_content` for Contents API data at the pinned base or head.
-The tools preserve GitHub response fields and leave pagination and decoding
-to the caller. The runner writes a JSON review to stdout.
+Wrev reviews GitHub pull requests against pinned commits. Run it locally to
+get structured findings, or apply the `wrev` label to run it through the
+Railway worker. Wrev uses a Rust review harness with embedded QuickJS and
+authenticates model requests through Sign in with ChatGPT.
 
-## Run
+## Run locally
 
-Build on native Linux or macOS with `cargo build --locked`. Use
-`cargo run --locked -- login` to sign in with ChatGPT and
-`cargo run --locked -- models` to find your account's model slug.
-
-Set `OPENAI_MODEL` and supply `WREV_GITHUB_TOKEN` through your secret store.
-Use a fine-grained GitHub token restricted to the repositories you review,
-with read access to Contents and Pull requests. A fork's head files are
-available only when the credential can read the fork. For noninteractive
-hosting, supply the template's Sign in with ChatGPT access token through
-`CHATGPT_ACCESS_TOKEN`.
+You’ll need Git and a GitHub token with read access to **Contents** and **Pull
+requests** for the repository. An unpublished fork commit must also be
+accessible to the credential.
 
 ```sh
-cargo run --locked -- review OWNER/REPO 123
+nix-shell -p cargo rustc cmake pkg-config --run 'cargo build --locked --bin wrev'
+./target/debug/wrev login
+./target/debug/wrev models
 ```
 
-Native `wrev review` requires Git. It fetches the PR's base and head commits
-into a temporary repository and uses the same read-only tools as
-`wrev reviewbench CHECKOUT PR_JSON`. It reads Git objects without running code
-from the pull request. Set `WREV_SESSION_DIR` and build with
-`--features sqlite-backend` to persist checkpoints.
+Set `WREV_GITHUB_TOKEN` through your secret manager. Choose a slug from
+`wrev models` and run the review.
 
-## Production updates
+```sh
+OPENAI_MODEL='your-model-slug' ./target/debug/wrev review OWNER/REPO 123
+```
 
-Pushes to `main` run a serialized workflow that opens or updates a PR in
-`r33drichards/webhook` with the latest merged Wrev SHA. The workflow reads
-`WREV_WORKER_TOKEN` from this repository's Actions secrets. Scope that token
-to `r33drichards/webhook` with Contents and Pull requests write access.
-Merging the worker PR triggers Railway's production build from `master`.
+The native CLI fetches the base and head into a temporary bare Git repository
+and returns JSON on stdout. The `reviewbench CHECKOUT PR_JSON` command uses the
+same snapshot reviewer with a supplied checkout. Build with
+`--features sqlite-backend` and set `WREV_SESSION_DIR` to save checkpoints.
+See [build instructions](BUILD.md) and [checkpoint recovery](docs/durability.md).
+
+## Architecture
+
+### Runtime and harness
+
+The host runs the Rust harness. The model calls `run_js` to inspect evidence
+through Rust tools registered for the current PR. QuickJS executes that
+JavaScript in a fresh context for each call.
+
+```mermaid
+flowchart LR
+    Local["Local CLI or Railway worker"] --> Native["Native Rust executable"]
+    Wasmtime["Wasmtime"] --> WASI["WASI Preview 2 component"]
+    Wasmer["Wasmer WCGI"] --> WASIX["WASIX module"]
+    Native --> Harness["Rust review harness"]
+    WASI --> Harness
+    WASIX --> Harness
+    Harness <-->|"Responses stream"| Model["OpenAI model"]
+    Harness -->|"run_js"| JS["Fresh QuickJS context"]
+    JS -->|"mcp.callTool"| Tools["Registered Rust review tools"]
+    Tools -->|"Evidence"| Harness
+    Harness --> Result["Review JSON"]
+```
+
+### Filesystem and security boundaries
+
+```mermaid
+flowchart TB
+    subgraph Host["Host process or WebAssembly runtime"]
+      subgraph Rust["Rust harness"]
+        Context["QuickJS invocation"] -->|"Registered tool calls"| Scope["PR identity, path and ref checks"]
+        Scope -->|"Native reads"| Git["Pinned Git objects and diffs"]
+        Scope -->|"Wasm reads"| API["GitHub API at pinned refs"]
+        Checkpoint["Optional SQLite checkpoints"] --> Storage["Session directory"]
+      end
+      Credentials["GitHub and ChatGPT credentials"] --> Rust
+      Wasm["Wasmtime host grants"] -->|"WASI HTTP"| API
+      Wasm -->|"Explicit directory preopen"| Storage
+    end
+```
+
+- **Native filesystem.** Git objects and diffs are read as data. Wrev does
+  not run code from the PR. The Railway worker stores queue data, encrypted
+  credentials, and session checkpoints on its mounted volume.
+- **Wasmtime filesystem.** The component reads PR files through the GitHub
+  API. To persist checkpoints, the host preopens a session directory and
+  passes its guest path as `WREV_SESSION_DIR`. WASI HTTP supplies network access
+  to the Rust harness.
+- **QuickJS.** Review scripts get the registered tool bridge and console
+  output, with execution time, memory, stack, source, and output limits.
+  GitHub and model requests are made by the Rust harness. Review tools check
+  the permitted repository and commit before reading file content.
+- **Webhook.** Verify the GitHub signature and scope incoming events to the
+  configured repositories or owner. Railway uses separate credentials for
+  reading PRs and writing comments or removing the trigger label.
+
+## Listen for the label
+
+The [Railway worker](https://github.com/r33drichards/webhook/blob/master/docs/Railway-wrev.md)
+queues signed GitHub events on its own service. Applying `wrev` posts a start
+comment when commenting is configured. Wrev updates the same comment with the
+findings and removes the trigger label after a successful review. Removing the
+label during a review cancels it. Operators can inspect stored results at
+`GET /admin/reviews`.
+
+The Wasmer WCGI listener handles `POST /github/webhook` inline. Configure
+`WREV_REPOSITORIES` and `WREV_WEBHOOK_SECRET` and use `GET /health` to check
+configuration. Successful matching deliveries return HTTP 204 and emit review
+JSON to stderr. GitHub expects a webhook response within 10 seconds, which is
+shorter than some reviews. A redelivery can run the review again. The Wasmtime
+component can also be invoked by a separate webhook server. See
+[Wasm build and deployment instructions](BUILD.md).
+
+## Production releases
+
+A push to `wrev/main` runs one pin-update job at a time. It opens or updates a
+worker PR with the latest merged Wrev SHA. Merging the worker PR triggers
+Railway to build from `webhook/master`. The worker Dockerfile pin controls the
+reviewer version. The Wrev repository's `WREV_WORKER_TOKEN` Actions secret
+needs **Contents** and **Pull requests** write access on the worker repo.
 
 ## ReviewBench results
 
@@ -59,36 +131,11 @@ completed all 219 pull requests.
 | False positives (% of submitted findings) | 48 (37.5%) | **61 (29.2%)** |
 | Novel true positives | 21 | **39** |
 
-## Wasmer webhook
+## Configuration
 
-Wasmer uses WCGI to start a fresh `wrev wcgi` process for each HTTP request.
-Configure GitHub's Pull requests webhook to send JSON to `/github/webhook`,
-using the same `WREV_WEBHOOK_SECRET` as the app. Set `WREV_REPOSITORIES` to the
-comma-separated repository allowlist. A signed, matching label event runs its
-review inline and returns HTTP 204 on success. Reviews go to stderr as JSON,
-which Wasmer captures in app logs. Keep logs private when reviewing private code.
-
-GitHub expects a webhook response within 10 seconds. A longer review can appear
-as a timed-out delivery, and a redelivery can run the review again. WCGI has no
-cross-invocation queue or deduplication. `GET /health` checks webhook configuration.
-
-## Run reviews in Wasmtime
-
-Build the WASI Preview 2 command with `cargo build --locked --release --target
-wasm32-wasip2 --bin wrev` and run it with Wasmtime 51. It supports `review`
-and `models`, with HTTPS requests provided by the host through WASI HTTP.
-Supply credentials through the host environment. The Wasmer WCGI deployment
-can still receive webhooks directly. To use the Wasmtime component from a
-webhook server, configure that server to invoke `review OWNER/REPO PR_NUMBER`.
-See [build and run instructions](BUILD.md#wasmtime).
-
-## Deployment configuration
-
-`wrev` loads deployment settings with the Rust `config` crate. Set each option
-independently in the process environment. Unset options use
-the defaults below. Timeouts and byte limits must be positive integers.
-Supply credentials through your deployment's secret store. See the
-[Twelve-Factor config guidance](https://12factor.net/config).
+Set `OPENAI_MODEL` and `WREV_GITHUB_TOKEN` for live reviews. Noninteractive
+runtimes can receive a Sign in with ChatGPT access token through
+`CHATGPT_ACCESS_TOKEN`. Timeouts and byte limits must be positive integers.
 
 | Variable | Default | Scope |
 | --- | ---: | --- |
@@ -105,31 +152,18 @@ Supply credentials through your deployment's secret store. See the
 | `WREV_OAUTH_CALLBACK_TIMEOUT_SECS` | 300 | Time to complete the local browser sign-in |
 | `WREV_OAUTH_READ_TIMEOUT_SECS` | 2 | Reading the local sign-in callback |
 
-The WCGI webhook also requires `WREV_REPOSITORIES` and `WREV_WEBHOOK_SECRET`.
-Both review modes require `OPENAI_MODEL` and `WREV_GITHUB_TOKEN`. Supply
-`CHATGPT_ACCESS_TOKEN` for noninteractive deployments.
-
 ### Hosted ChatGPT credentials
 
-Build with `mysql-backend`, apply
-`migrations/002_chatgpt_credentials.sql` to its MySQL database, and configure
-the [verified TLS connection](MYSQL_BACKEND.md). Set two independent runtime
-secrets: `WREV_CREDENTIAL_ADMIN_TOKEN` (at least 32 random ASCII characters)
-and `WREV_CREDENTIAL_ENCRYPTION_KEY` (32 random bytes encoded as 64 hex
-characters). Use the same encryption key on every replica and keep it available
-across deployments. Leave the admin token unset to keep the endpoint disabled.
+For the built-in Wasmer listener, enable `mysql-backend`, apply
+[migration 002](migrations/002_chatgpt_credentials.sql), and configure
+[verified MySQL TLS](MYSQL_BACKEND.md). Set independent
+`WREV_CREDENTIAL_ADMIN_TOKEN` (at least 32 random ASCII characters) and
+`WREV_CREDENTIAL_ENCRYPTION_KEY` (32 random bytes as 64 hex characters). Keep
+the encryption key consistent across replicas and deployments.
 
-Send an HTTPS `PUT /admin/chatgpt-credentials` with
-`Authorization: Bearer <WREV_CREDENTIAL_ADMIN_TOKEN>` and a JSON body containing
-`access_token` and `expires_at` (Unix seconds). Include both `refresh_token`
-and the issued OAuth `client_id` to enable refresh. Supply the body from private
-input or a secret manager. HTTP 204 means MySQL accepted the encrypted replacement.
-The endpoint has no read method.
-
-When enabled, the webhook handler reads this record for each model call. It refreshes
-near expiry and stores the rotated credentials under a MySQL lock shared across
-replicas. The hosted credential store takes precedence over the environment
-token for webhook reviews. If a refresh fails or is interrupted, provision a
-fresh grant. Use a dedicated OAuth grant for the deployment so another client
-doesn't independently rotate the same refresh token. Confirm that the deployment
-is eligible for [ChatGPT plan usage](https://developers.openai.com/siwc/token-sharing-open-source).
+Send an authenticated HTTPS `PUT /admin/chatgpt-credentials` with
+`access_token` and `expires_at` in Unix seconds. Include `refresh_token` and
+the issued `client_id` for renewal. The stored grant takes precedence over
+`CHATGPT_ACCESS_TOKEN` for this listener. Use a dedicated grant for the
+deployment to avoid independent refreshes. For Railway’s separate SQLite
+store, see the [worker runbook](https://github.com/r33drichards/webhook/blob/master/docs/Railway-wrev.md).
