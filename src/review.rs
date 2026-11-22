@@ -1,5 +1,5 @@
 use crate::config::{self, ReviewConfig};
-use crate::review_search::{self, File, Side};
+use crate::review_search::{self, File, Inventory, Side};
 #[cfg(all(target_os = "wasi", target_env = "p2"))]
 use crate::wasi_github::GitHub;
 use anyhow::{Context, Result, anyhow, ensure};
@@ -198,32 +198,76 @@ fn register_tools(
             }
         },
     )?;
+    let tree_client = client.clone();
+    let (tree_base, tree_head) = (search_base.clone(), search_head.clone());
     let search_client = client.clone();
-    review_search::register(&mut tools, move |side, path| {
-        let client = search_client.clone();
-        let pair = match side {
-            Side::Base => Some(search_base.clone()),
-            Side::Head => search_head.clone(),
-        };
-        async move {
-            let Some((repository, reference)) = pair else {
-                return File::Skipped("head_unavailable");
+    review_search::register(
+        &mut tools,
+        move |side| {
+            let client = tree_client.clone();
+            let pair = match side {
+                Side::Base => Some(tree_base.clone()),
+                Side::Head => tree_head.clone(),
             };
-            let Ok(route) = file_route(&repository, &path) else {
-                return File::Skipped("invalid_path");
+            async move {
+                let (repository, reference) = pair.context("PR head repository unavailable")?;
+                let route = format!("/repos/{repository}/git/trees/{reference}");
+                let tree: SearchTree =
+                    github_get(&client, route, Some(&[("recursive", 1)]), timeout).await?;
+                Ok(Inventory {
+                    paths: tree
+                        .tree
+                        .into_iter()
+                        .filter(|entry| {
+                            entry.kind == "blob"
+                                && matches!(entry.mode.as_str(), "100644" | "100755")
+                        })
+                        .map(|entry| entry.path)
+                        .collect(),
+                    truncated: tree.truncated,
+                })
+            }
+        },
+        move |side, path, remaining| {
+            let client = search_client.clone();
+            let pair = match side {
+                Side::Base => Some(search_base.clone()),
+                Side::Head => search_head.clone(),
             };
-            let query = [("ref", reference.as_str())];
-            let Ok(contents) = github_get::<Value>(&client, route, Some(&query), timeout).await
-            else {
-                return File::Skipped("unreadable");
-            };
-            decode_search_file(contents)
-        }
-    })?;
+            async move {
+                let Some((repository, reference)) = pair else {
+                    return File::Skipped("head_unavailable");
+                };
+                let Ok(route) = file_route(&repository, &path) else {
+                    return File::Skipped("invalid_path");
+                };
+                let query = [("ref", reference.as_str())];
+                let Ok(contents) = github_get::<Value>(&client, route, Some(&query), timeout).await
+                else {
+                    return File::Skipped("unreadable");
+                };
+                decode_search_file(contents, remaining)
+            }
+        },
+    )?;
     Ok(tools)
 }
 
-fn decode_search_file(contents: Value) -> File {
+#[derive(serde::Deserialize)]
+struct SearchTree {
+    tree: Vec<SearchTreeEntry>,
+    truncated: bool,
+}
+
+#[derive(serde::Deserialize)]
+struct SearchTreeEntry {
+    path: String,
+    mode: String,
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+fn decode_search_file(contents: Value, remaining: usize) -> File {
     use base64::{Engine, engine::general_purpose::STANDARD};
 
     if contents["type"] != "file" {
@@ -232,7 +276,8 @@ fn decode_search_file(contents: Value) -> File {
     let Some(size) = contents["size"].as_u64() else {
         return File::Skipped("unreadable");
     };
-    if size > review_search::MAX_FILE_BYTES as u64 {
+    let limit = remaining.min(review_search::MAX_GITHUB_CONTENT_BYTES);
+    if size > limit as u64 {
         return File::Skipped("too_large");
     }
     let Some(encoded) = contents["content"]
@@ -241,7 +286,7 @@ fn decode_search_file(contents: Value) -> File {
     else {
         return File::Skipped("unsupported_encoding");
     };
-    let max_encoded = review_search::MAX_FILE_BYTES.div_ceil(3) * 4;
+    let max_encoded = limit.div_ceil(3) * 4;
     // Contents API base64 is line-wrapped. Limit the encoded payload too,
     // rather than trusting a claimed file size.
     let encoded: Vec<_> = encoded
@@ -789,6 +834,14 @@ mod tests {
                 json!({"type":"file","size":8,"encoding":"base64","content":"bmV3IHRleHQ="}),
             ),
             (
+                format!("/repos/contributor/fork/git/trees/{HEAD}?recursive=1"),
+                json!({"truncated": false, "tree": [
+                    {"path":"src/new file.rs","mode":"100644","type":"blob"},
+                    {"path":"ignored-link","mode":"120000","type":"blob"},
+                    {"path":"submodule","mode":"160000","type":"commit"}
+                ]}),
+            ),
+            (
                 format!("/repos/contributor/fork/contents/src/new%20file.rs?ref={HEAD}"),
                 json!({"type":"file","size":8,"encoding":"base64","content":"bmV3\nIHRleHQ="}),
             ),
@@ -857,7 +910,8 @@ mod tests {
             console.log(file.structuredContent.content);
             for (const [side, expected] of [["head", "new text"], ["base", "old text"]]) {
                 const rg = (await mcp.callTool("rust", "rg", {
-                    side, pattern:"TEXT", paths:[page.items[0].filename], fixed_strings:true, ignore_case:true
+                    side, pattern:"TEXT", ...(side === "base" ? {paths:[page.items[0].filename]} : {}),
+                    fixed_strings:true, ignore_case:true
                 })).structuredContent;
                 const found = rg.files[0].matches[0];
                 if (found.text !== expected || found.line !== 1) throw new Error(JSON.stringify(rg));

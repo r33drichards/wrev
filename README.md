@@ -81,20 +81,19 @@ flowchart TB
   output, with execution time, memory, stack, source, and output limits.
   GitHub and model requests are made by the Rust harness. Review tools check
   the permitted repository and commit before reading file content.
-- **Search.** `rg` uses ripgrep's Rust libraries in the review tool bridge.
-  It searches up to eight explicitly named repository-relative files at the
-  pinned head (default) or base, using the same read-only Git blobs or GitHub
-  Contents API as the review. It never traverses the filesystem or runs the
-  ripgrep CLI. Binary files and files over 256 KiB are skipped, and the tool
-  caps output at 20 matching lines by default (50 maximum).
+- **Search.** `rg` uses ripgrep's Rust libraries to search tracked text in
+  the pinned head (default) or base. Omit `paths` to search the repository,
+  or pass a list of repository-relative files. Repository-wide search
+  enumerates regular tracked files. It never reads the host worktree
+  or runs the ripgrep CLI.
+  Match output and scan work are bounded to fit an agent call. Results say
+  when scanning stops early and report skipped files; GitHub's Contents API
+  can skip large files it cannot return inline.
 
   ```js
   const { structuredContent } = await mcp.callTool("rust", "rg", {
     pattern: "todo|fixme",
-    paths: ["src/main.rs", "src/review.rs"],
-    side: "head",
-    ignore_case: true,
-    max_matches: 12
+    ignore_case: true
   });
   console.log(JSON.stringify(structuredContent));
   ```

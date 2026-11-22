@@ -1,6 +1,6 @@
 use crate::{
     config, model, review,
-    review_search::{self, File, Side},
+    review_search::{self, File, Inventory, Side},
 };
 use anyhow::{Context, Result, ensure};
 use minimal_mcp_agent::quickjs_tools::QuickJsTools;
@@ -190,16 +190,52 @@ fn register_search(
     base: String,
     head: String,
 ) -> Result<()> {
-    review_search::register(tools, move |side, path| {
-        let reference = match side {
-            Side::Base => &base,
-            Side::Head => &head,
-        };
-        std::future::ready(search_blob(&checkout, reference, &path))
-    })
+    let tree_checkout = checkout.clone();
+    let (tree_base, tree_head) = (base.clone(), head.clone());
+    review_search::register(
+        tools,
+        move |side| {
+            let reference = match side {
+                Side::Base => &tree_base,
+                Side::Head => &tree_head,
+            };
+            std::future::ready(search_inventory(&tree_checkout, reference))
+        },
+        move |side, path, remaining| {
+            let reference = match side {
+                Side::Base => &base,
+                Side::Head => &head,
+            };
+            std::future::ready(search_blob(&checkout, reference, &path, remaining))
+        },
+    )
 }
 
-fn search_blob(checkout: &Path, reference: &str, path: &str) -> File {
+fn search_inventory(checkout: &Path, reference: &str) -> Result<Inventory> {
+    let bytes = git(checkout, &["ls-tree", "-rz", "--full-tree", reference])?;
+    let mut truncated = false;
+    let mut paths = Vec::new();
+    for entry in bytes
+        .split(|byte| *byte == 0)
+        .filter(|entry| !entry.is_empty())
+    {
+        let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
+            truncated = true;
+            continue;
+        };
+        let (header, path) = entry.split_at(tab);
+        if !header.starts_with(b"100644 blob ") && !header.starts_with(b"100755 blob ") {
+            continue; // No symlinks, submodules, or worktree entries.
+        }
+        match std::str::from_utf8(&path[1..]) {
+            Ok(path) => paths.push(path.to_owned()),
+            Err(_) => truncated = true,
+        }
+    }
+    Ok(Inventory { paths, truncated })
+}
+
+fn search_blob(checkout: &Path, reference: &str, path: &str, remaining: usize) -> File {
     let object = format!("{reference}:{path}");
     let Ok(size) = git(checkout, &["cat-file", "-s", &object]) else {
         return File::Skipped("unreadable");
@@ -210,7 +246,7 @@ fn search_blob(checkout: &Path, reference: &str, path: &str) -> File {
     else {
         return File::Skipped("unreadable");
     };
-    if size > review_search::MAX_FILE_BYTES {
+    if size > remaining {
         return File::Skipped("too_large");
     }
     match git(checkout, &["cat-file", "blob", &object]) {
@@ -277,7 +313,7 @@ mod tests {
         fs::create_dir(&checkout)?;
         git(&checkout, &["init", "--template="])?;
         let commit = || -> Result<String> {
-            git(&checkout, &["add", "source.txt"])?;
+            git(&checkout, &["add", "--all"])?;
             git(
                 &checkout,
                 &[
@@ -297,6 +333,9 @@ mod tests {
                 .to_owned())
         };
 
+        for n in 0..12 {
+            fs::write(checkout.join(format!("a-{n:02}.txt")), "distractor\n")?;
+        }
         fs::write(checkout.join("source.txt"), "header\nbase needle\n")?;
         let base = commit()?;
         fs::write(checkout.join("source.txt"), "header\nhead needle\n")?;
@@ -309,13 +348,18 @@ mod tests {
         register_search(&mut tools, checkout, base, head)?;
         let runtime = Runtime::new()?;
         let code = r#"
-          const args = {pattern:"needle$", paths:["source.txt","untracked.txt"]};
+          const args = {pattern:"needle$"};
+          const explicit = (await mcp.callTool("rust", "rg", {
+            ...args, paths:[...Array.from({length:12}, (_, n) => "a-"+String(n).padStart(2,"0")+".txt"), "source.txt","untracked.txt"]
+          })).structuredContent;
+          if (explicit.files[0].path !== "source.txt" || explicit.skipped[0].path !== "untracked.txt")
+            throw new Error(JSON.stringify(explicit));
           for (const side of ["base", "head"]) {
             const r = (await mcp.callTool("rust", "rg", {...args, side})).structuredContent;
             if (r.files.length !== 1 || r.files[0].matches.length !== 1 ||
                 r.files[0].matches[0].line !== 2 ||
                 r.files[0].matches[0].text !== side+" needle" ||
-                r.skipped[0].path !== "untracked.txt" || r.truncated) {
+                r.skipped.length !== 0 || r.truncated) {
                 throw new Error(JSON.stringify(r));
             }
           }
