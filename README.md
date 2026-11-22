@@ -42,6 +42,7 @@ completed all 219 pull requests.
 | Augmented precision | 62.5% | 70.8% |
 | Augmented recall | 3.4% | 6.1% |
 | Findings submitted | 128 | 209 |
+| False positives (% of submitted findings) | 48 (37.5%) | 61 (29.2%) |
 | Novel true positives | 21 | 39 |
 
 ## Wasmer webhook
