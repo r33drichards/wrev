@@ -57,30 +57,33 @@ flowchart LR
 
 ```mermaid
 flowchart TB
-    subgraph Host["Host process or WebAssembly runtime"]
-      subgraph Rust["Rust harness"]
-        Context["QuickJS invocation"] -->|"Registered tool calls"| Scope["PR identity, path and ref checks"]
-        Scope -->|"Native reads"| Git["Pinned Git objects and diffs"]
-        Scope -->|"Wasm reads"| API["GitHub API at pinned refs"]
-        Checkpoint["Optional SQLite checkpoints"] --> Storage["Session directory"]
-      end
-      Credentials["GitHub and ChatGPT credentials"] --> Rust
-      Wasm["Wasmtime host grants"] -->|"WASI HTTP"| API
-      Wasm -->|"Explicit directory preopen"| Storage
-    end
+    Request["Review request: repository, PR number, base SHA, head SHA"]
+    Request --> Host["Trusted host fetches pinned Git objects"]
+    Host --> Mount["Mounted evidence: /work/repo and /work/pr"]
+    Request --> Hook["Rust pre-turn hook"]
+    Mount --> Hook
+    Hook -->|"Validate request and register read-only tools"| Tools["Scoped filesystem tools"]
+    JS["QuickJS context"] -->|"mcp.callTool"| Tools
+    Tools --> Mount
+    Harness["Rust harness"] <-->|"Model HTTP"| Model["OpenAI model"]
+    Harness --> Checkpoint["Separate SQLite session directory"]
 ```
 
-- **Native filesystem.** Git objects and diffs are read as data. Wrev does
-  not run code from the PR. The Railway worker stores queue data, encrypted
-  credentials, and session checkpoints on its mounted volume.
-- **Wasmtime filesystem.** The component reads PR files through the GitHub
-  API. To persist checkpoints, the host preopens a session directory and
-  passes its guest path as `WREV_SESSION_DIR`. WASI HTTP supplies network access
-  to the Rust harness.
-- **QuickJS.** Review scripts get the registered tool bridge and console
-  output, with execution time, memory, stack, source, and output limits.
-  GitHub and model requests are made by the Rust harness. Review tools check
-  the permitted repository and commit before reading file content.
+- **Snapshot.** The host materializes the pinned head checkout and supplies
+  `/work/pr/pr.json` and `/work/pr/diff.patch` in ReviewBench's layout.
+  Wrev adds the pinned base tree at `/work/base`. The hook runs before
+  the first model or tool call, including during recovery.
+- **QuickJS.** Review scripts use `fs.readText()` and `fs.listDir()` to
+  read the staged evidence, with execution time, memory, stack, source,
+  and output limits. The bridge rejects traversal, symlinks, and paths
+  outside the review inputs.
+- **Review instructions.** The model checks code quality, security,
+  performance, testing, and documentation. The harness asks it to read
+  every diff page and back each finding with evidence.
+- **Runtime.** Native Wrev stages evidence in a private temporary directory.
+  Wasm hosts provide a per-review mount. Wasmtime uses WASI HTTP for model
+  requests and can preopen a separate directory for SQLite checkpoints.
+
 - **Webhook.** Verify the GitHub signature and scope incoming events to the
   configured repositories or owner. Railway uses separate credentials for
   reading PRs and writing comments or removing the trigger label.
@@ -94,7 +97,9 @@ findings and removes the trigger label after a successful review. Removing the
 label during a review cancels it. Operators can inspect stored results at
 `GET /admin/reviews`.
 
-The Wasmer WCGI listener handles `POST /github/webhook` inline. Configure
+The Wasmer WCGI listener handles `POST /github/webhook` inline. The host must
+prepare and mount a snapshot for that delivery at `WREV_SNAPSHOT_DIR`. Wrev
+checks the mount against the signed event before reviewing. Configure
 `WREV_REPOSITORIES` and `WREV_WEBHOOK_SECRET` and use `GET /health` to check
 configuration. Successful matching deliveries return HTTP 204 and emit review
 JSON to stderr. GitHub expects a webhook response within 10 seconds, which is
@@ -112,28 +117,31 @@ needs **Contents** and **Pull requests** write access on the worker repo.
 
 ## ReviewBench results
 
-Wrev and the Codex CLI each reviewed the same 219 frozen pull requests from the
+Two Wrev builds and the Codex CLI each reviewed the same 219 frozen pull requests from the
 [ReviewBench full corpus](https://github.com/review-bench/ReviewBench/blob/082f65f6746c39b6ac25b0a62c1b0d5131a3803a/corpus/manifest.json)
 with GPT-6 Luna (`gpt-6-luna`). The
 [ReviewBench offline judge](https://github.com/review-bench/ReviewBench/blob/082f65f6746c39b6ac25b0a62c1b0d5131a3803a/docs/OFFLINE_EVAL.md)
 used GPT-6.1 Terra (`gpt-6.1-terra`) to match and classify findings.
-These are micro-averaged results from one local pass per reviewer using a
-development version of Wrev's local benchmark adapter. Both reviewers
-completed all 219 pull requests.
+The table shows micro-averaged results from one local run per configuration.
+Wrev main ran at [`1fd9b4b`](https://github.com/r33drichards/wrev/commit/1fd9b4bc8104dfc2bed6058a872ca9b6873f0eb1).
+The filesystem build used the direct QuickJS filesystem tools and the expanded
+review instructions. All three runs completed all 219 pull requests and used
+the same judge, scoring prompts, and golden set.
 
-| Metric | Wrev | Codex CLI |
-| --- | ---: | ---: |
-| Grounded precision | 79.7% | **83.2%** |
-| Grounded recall | 2.6% | **4.7%** |
-| Augmented precision | 62.5% | **70.8%** |
-| Augmented recall | 3.4% | **6.1%** |
-| Findings submitted | 128 | **209** |
-| False positives (% of submitted findings) | 48 (37.5%) | **61 (29.2%)** |
-| Novel true positives | 21 | **39** |
+| Metric | Wrev filesystem | Wrev main | Codex CLI |
+| --- | ---: | ---: | ---: |
+| Findings submitted | **331** | 132 | 209 |
+| Grounded precision | **86.4%** | 85.2% | 83.2% |
+| Grounded recall | **7.8%** | 3.1% | 4.7% |
+| Augmented precision | **75.5%** | 74.2% | 70.8% |
+| Augmented recall | **10.6%** | 4.2% | 6.1% |
+| False positives (% of submissions) | **81 (24.5%)** | 34 (25.8%) | 61 (29.2%) |
+| Novel true positives | **79** | 29 | 39 |
 
 ## Configuration
 
-Set `OPENAI_MODEL` and `WREV_GITHUB_TOKEN` for live reviews. Noninteractive
+Set `OPENAI_MODEL` for reviews. Native `review` and `prepare-review` use
+`WREV_GITHUB_TOKEN` for host-side preparation. Noninteractive
 runtimes can receive a Sign in with ChatGPT access token through
 `CHATGPT_ACCESS_TOKEN`. Timeouts and byte limits must be positive integers.
 

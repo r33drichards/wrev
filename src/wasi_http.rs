@@ -18,7 +18,6 @@ pub struct Response {
     stream: InputStream,
     _body: IncomingBody,
     deadline: Instant,
-    pub links: Vec<String>,
 }
 
 impl io::Read for Response {
@@ -139,12 +138,6 @@ pub fn request(
         (200..300).contains(&status),
         "HTTP {status} from {authority}"
     );
-    let links = response
-        .headers()
-        .get("link")
-        .into_iter()
-        .filter_map(|value| String::from_utf8(value).ok())
-        .collect();
     let body = response
         .consume()
         .map_err(|_| anyhow!("Missing HTTP response body"))?;
@@ -155,6 +148,5 @@ pub fn request(
         stream,
         _body: body,
         deadline,
-        links,
     })
 }

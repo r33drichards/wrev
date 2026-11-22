@@ -121,6 +121,7 @@ fn positive_size(key: &str, default: usize) -> Result<usize> {
 
 pub struct ReviewConfig {
     pub model: String,
+    #[cfg(not(target_os = "wasi"))]
     pub github_timeout: Duration,
     pub script: ScriptLimits,
 }
@@ -130,6 +131,7 @@ impl ReviewConfig {
         let defaults = ScriptLimits::default();
         Ok(Self {
             model: required("OPENAI_MODEL")?,
+            #[cfg(not(target_os = "wasi"))]
             github_timeout: seconds("WREV_GITHUB_TIMEOUT_SECS", 20)?,
             script: ScriptLimits {
                 timeout: seconds(

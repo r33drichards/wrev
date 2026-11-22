@@ -52,9 +52,10 @@ pub fn prompt(
     model: &str,
     messages: &[Value],
     tools: &[Value],
+    instructions: &str,
 ) -> Result<Vec<Value>> {
     let body = json!({"model": model, "input": messages,
-        "tools": tools, "store": false, "stream": true,
+        "tools": tools, "instructions": instructions, "store": false, "stream": true,
         "include": ["reasoning.encrypted_content"]});
     #[cfg(not(all(target_os = "wasi", target_env = "p2")))]
     let response = client

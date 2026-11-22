@@ -310,6 +310,15 @@ impl QuickJsTools {
                             return result;
                         },
                     };
+                    const fsCall = globalThis.mcp.callTool;
+                    if (catalog.some(tool => tool.server === "rust" && tool.name === "fs_read_text")) {
+                        globalThis.fs = Object.freeze({
+                            readText: async (path, {startLine, maxLines} = {}) =>
+                                (await fsCall("rust", "fs_read_text", {path, start_line: startLine, max_lines: maxLines})).structuredContent,
+                            listDir: async (path, {offset} = {}) =>
+                                (await fsCall("rust", "fs_list_dir", {path, offset})).structuredContent,
+                        });
+                    }
                     globalThis.console = {log: (...args) => write(args.map(value =>
                         typeof value === "string" ? value : stringify(value) ?? toString(value)
                     ).join(" "))};

@@ -28,6 +28,7 @@ fn output() -> Vec<Value> {
 fn crash_at_every_boundary_never_blindly_replays_effects() {
     for boundary in [
         Event::TurnStarted,
+        Event::TurnPreparing,
         Event::ModelStarted,
         Event::ModelOutput,
         Event::ToolStarted,
@@ -350,7 +351,7 @@ fn persistence_failure_stops_before_next_effect_and_before_other_hooks() {
             .is_err()
         );
         assert_eq!(effects.get(), expected_effects);
-        assert_eq!(hooks.get(), fail_at - 1);
+        assert_eq!(hooks.get(), fail_at - 1 + usize::from(fail_at > 1));
     }
 }
 
@@ -385,6 +386,7 @@ fn hooks_observe_required_order_and_complete_reasoning() {
         events,
         vec![
             Event::TurnStarted,
+            Event::TurnPreparing,
             Event::ModelStarted,
             Event::ModelOutput,
             Event::ToolStarted,

@@ -69,7 +69,10 @@ pub struct DurabilityHook<'a> {
     pub store: &'a mut dyn SessionStore,
 }
 impl LifecycleHook for DurabilityHook<'_> {
-    fn on_event(&mut self, _: Event, state: &Checkpoint) -> Result<()> {
+    fn on_event(&mut self, event: Event, state: &Checkpoint) -> Result<()> {
+        if event == Event::TurnPreparing {
+            return Ok(());
+        }
         self.store.save(state)
     }
 }

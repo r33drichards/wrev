@@ -323,7 +323,15 @@ mod tests {
                 let mut request = server
                     .recv_timeout(std::time::Duration::from_secs(10))?
                     .context("Missing fixture request")?;
-                let authorization = crate::review::header(&request, "Authorization");
+                let mut authorization_headers = request
+                    .headers()
+                    .iter()
+                    .filter(|header| header.field.equiv("Authorization"));
+                let authorization = authorization_headers
+                    .next()
+                    .map(|header| header.value.as_str().to_owned());
+                let authorization =
+                    authorization.filter(|_| authorization_headers.next().is_none());
                 let status = store.put_body(authorization.as_deref(), request.as_reader());
                 request.respond(tiny_http::Response::empty(tiny_http::StatusCode(status)))?;
             }
