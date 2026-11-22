@@ -117,26 +117,25 @@ needs **Contents** and **Pull requests** write access on the worker repo.
 
 ## ReviewBench results
 
-Two Wrev builds and the Codex CLI each reviewed the same 219 frozen pull requests from the
+Wrev and the Codex CLI each reviewed the same 219 frozen pull requests from the
 [ReviewBench full corpus](https://github.com/review-bench/ReviewBench/blob/082f65f6746c39b6ac25b0a62c1b0d5131a3803a/corpus/manifest.json)
 with GPT-6 Luna (`gpt-6-luna`). The
 [ReviewBench offline judge](https://github.com/review-bench/ReviewBench/blob/082f65f6746c39b6ac25b0a62c1b0d5131a3803a/docs/OFFLINE_EVAL.md)
 used GPT-6.1 Terra (`gpt-6.1-terra`) to match and classify findings.
-The table shows micro-averaged results from one local run per configuration.
-Wrev main ran at [`1fd9b4b`](https://github.com/r33drichards/wrev/commit/1fd9b4bc8104dfc2bed6058a872ca9b6873f0eb1).
-The filesystem build used the direct QuickJS filesystem tools and the expanded
-review instructions. All three runs completed all 219 pull requests and used
-the same judge, scoring prompts, and golden set.
+The table shows micro-averaged results from one local run per reviewer.
+Wrev used the direct QuickJS filesystem tools and expanded review instructions.
+Both runs completed all 219 pull requests and used the same judge, scoring
+prompts, and golden set.
 
-| Metric | Wrev filesystem | Wrev main | Codex CLI |
-| --- | ---: | ---: | ---: |
-| Findings submitted | **331** | 132 | 209 |
-| Grounded precision | **86.4%** | 85.2% | 83.2% |
-| Grounded recall | **7.8%** | 3.1% | 4.7% |
-| Augmented precision | **75.5%** | 74.2% | 70.8% |
-| Augmented recall | **10.6%** | 4.2% | 6.1% |
-| False positives (% of submissions) | **81 (24.5%)** | 34 (25.8%) | 61 (29.2%) |
-| Novel true positives | **79** | 29 | 39 |
+| Metric | Wrev | Codex CLI |
+| --- | ---: | ---: |
+| Findings submitted | **331** | 209 |
+| Grounded precision | **86.4%** | 83.2% |
+| Grounded recall | **7.8%** | 4.7% |
+| Augmented precision | **75.5%** | 70.8% |
+| Augmented recall | **10.6%** | 6.1% |
+| False positives (% of submissions) | **81 (24.5%)** | 61 (29.2%) |
+| Novel true positives | **79** | 39 |
 
 ## Configuration
 
