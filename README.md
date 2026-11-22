@@ -125,7 +125,8 @@ used GPT-6.1 Terra (`gpt-6.1-terra`) to match and classify findings.
 The table shows micro-averaged results from one local run per reviewer.
 Wrev used the direct QuickJS filesystem tools and expanded review instructions.
 Both runs completed all 219 pull requests and used the same judge, scoring
-prompts, and golden set.
+prompts, and golden set. See the [ReviewBench methodology](docs/reviewbench-methodology.md)
+for the reviewer setup and metric definitions.
 
 | Metric | Wrev | Codex CLI |
 | --- | ---: | ---: |
