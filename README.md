@@ -81,6 +81,23 @@ flowchart TB
   output, with execution time, memory, stack, source, and output limits.
   GitHub and model requests are made by the Rust harness. Review tools check
   the permitted repository and commit before reading file content.
+- **Search.** `rg` uses ripgrep's Rust libraries to search tracked text in
+  the pinned head (default) or base. Omit `paths` to search the repository,
+  or pass a list of repository-relative files. Repository-wide search
+  enumerates regular tracked files. It never reads the host worktree
+  or runs the ripgrep CLI.
+  Match output and scan work are bounded to fit an agent call. Results say
+  when scanning stops early and report skipped files; GitHub's Contents API
+  can skip large files it cannot return inline.
+
+  ```js
+  const { structuredContent } = await mcp.callTool("rust", "rg", {
+    pattern: "todo|fixme",
+    ignore_case: true
+  });
+  console.log(JSON.stringify(structuredContent));
+  ```
+
 - **Webhook.** Verify the GitHub signature and scope incoming events to the
   configured repositories or owner. Railway uses separate credentials for
   reading PRs and writing comments or removing the trigger label.

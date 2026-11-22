@@ -17,14 +17,12 @@ use std::{
 };
 use tokio::time::{Instant, timeout_at};
 
-#[cfg(all(target_os = "wasi", target_env = "p2"))]
 tokio::task_local! {
-    // The component's synchronous WASI HTTP polling must honor the script's
-    // remaining time even while the Tokio timer cannot be polled.
+    // Rust tools doing multiple reads must honor the enclosing script's
+    // remaining time, including in synchronous WASI HTTP calls.
     static SCRIPT_DEADLINE: Instant;
 }
 
-#[cfg(all(target_os = "wasi", target_env = "p2"))]
 pub fn tool_timeout(timeout: Duration) -> Duration {
     SCRIPT_DEADLINE
         .try_with(|deadline| timeout.min(deadline.saturating_duration_since(Instant::now())))
@@ -261,7 +259,6 @@ impl QuickJsTools {
                             },
                             ToolHandler::Rust(handler) => {
                                 let call = handler(args);
-                                #[cfg(all(target_os = "wasi", target_env = "p2"))]
                                 let call = SCRIPT_DEADLINE.scope(deadline, call);
                                 match call.await {
                                     Ok(value) => {
