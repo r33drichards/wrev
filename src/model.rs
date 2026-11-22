@@ -100,6 +100,13 @@ fn read_completed(reader: impl BufRead) -> Result<Vec<Value>> {
                     let code = event["response"]["error"]["code"]
                         .as_str()
                         .or(event["code"].as_str())
+                        .or(event["error"]["code"].as_str())
+                        .or(event["error"]["type"].as_str())
+                        .or(event["response"]["incomplete_details"]["reason"].as_str())
+                        .filter(|code| {
+                            code.len() <= 100
+                                && code.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                        })
                         .unwrap_or("unknown");
                     bail!("Responses stream ended with {kind} ({code})");
                 }
@@ -123,6 +130,14 @@ mod tests {
         let s = "event: response.completed\ndata: {\ndata: \"type\":\"response.completed\",\"response\":{\"output\":[]}}\n\n";
         assert!(read_completed(s.as_bytes()).unwrap().is_empty());
     }
+    #[test]
+    fn reports_nested_error_codes_without_the_response_body() {
+        let data = b"data: {\"type\":\"error\",\"error\":{\"code\":\"subscription_sharing_usage_limit_exceeded\",\"message\":\"private\"}}\n\n";
+        let error = read_completed(&data[..]).unwrap_err().to_string();
+        assert!(error.contains("subscription_sharing_usage_limit_exceeded"));
+        assert!(!error.contains("private"));
+    }
+
     #[test]
     fn fails_closed_for_interruption_or_incomplete() {
         for s in [
