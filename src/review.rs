@@ -203,7 +203,6 @@ pub(crate) fn run_agent(
         .context("Model returned no final review")
 }
 
-#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
 pub(crate) fn benchmark_findings(
     repository: &str,
     number: u64,
