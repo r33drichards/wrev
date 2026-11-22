@@ -8,9 +8,11 @@ description = "Label-triggered pull request reviews with read-only GitHub tools"
 [features]
 default = ["quickjs-tools"]
 quickjs-tools = ["dep:rquickjs"]
+sqlite-backend = ["dep:rusqlite"]
 mysql-backend = ["dep:mysql", "dep:rustls", "dep:ring", "dep:subtle"]
 
 [dependencies]
+rusqlite = { version = "0.37", features = ["bundled"], optional = true }
 ring = { version = "0.17", optional = true }
 subtle = { version = "2", optional = true }
 sha2 = "0.10"

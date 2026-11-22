@@ -19,6 +19,16 @@ native CLI for browser login and the existing WCGI deployment below for
 the built-in webhook endpoint and MySQL credential store. For webhook integration, point the
 webhook server at the component and use its Wasmtime executor.
 
+### Per-session SQLite checkpoints
+
+Build the component with `--features sqlite-backend` and use the WASI SDK's
+`clang` as `CC_wasm32_wasip2`. Preopen a directory for this session and set
+`WREV_SESSION_DIR` to its guest path. wrev stores its checkpoints in
+`review.sqlite` within that directory. Reusing the directory resumes the
+same PR and pinned commits. The host must run at most one worker per
+directory. A checkpoint saved during a tool call stops recovery because
+the tool outcome is uncertain.
+
 ## Existing Wasmer deployment
 
 The WASIX build packages the `wrev` binary with embedded QuickJS-NG. Use

@@ -7,3 +7,6 @@ pub mod durable_mysql;
 
 #[cfg(feature = "quickjs-tools")]
 pub mod quickjs_tools;
+
+#[cfg(feature = "sqlite-backend")]
+pub mod durable_sqlite;
