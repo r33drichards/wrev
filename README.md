@@ -24,6 +24,26 @@ hosting, supply the template's Sign in with ChatGPT access token through
 cargo run --locked -- review OWNER/REPO 123
 ```
 
+## ReviewBench results
+
+Wrev and the Codex CLI each reviewed the same 219 frozen pull requests from the
+[ReviewBench full corpus](https://github.com/review-bench/ReviewBench/blob/082f65f6746c39b6ac25b0a62c1b0d5131a3803a/corpus/manifest.json)
+with GPT-6 Luna (`gpt-6-luna`). The
+[ReviewBench offline judge](https://github.com/review-bench/ReviewBench/blob/082f65f6746c39b6ac25b0a62c1b0d5131a3803a/docs/OFFLINE_EVAL.md)
+used GPT-6.1 Terra (`gpt-6.1-terra`) to match and classify findings.
+These are micro-averaged results from one local pass per reviewer using a
+development version of Wrev's local benchmark adapter. Both reviewers
+completed all 219 pull requests.
+
+| Metric | Wrev | Codex CLI |
+| --- | ---: | ---: |
+| Grounded precision | 79.7% | 83.2% |
+| Grounded recall | 2.6% | 4.7% |
+| Augmented precision | 62.5% | 70.8% |
+| Augmented recall | 3.4% | 6.1% |
+| Findings submitted | 128 | 209 |
+| Novel true positives | 21 | 39 |
+
 ## Wasmer webhook
 
 Wasmer uses WCGI to start a fresh `wrev wcgi` process for each HTTP request.
