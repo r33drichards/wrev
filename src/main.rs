@@ -10,6 +10,7 @@ mod config;
 mod hosted_auth;
 mod model;
 mod review;
+mod review_search;
 #[cfg(all(target_os = "wasi", target_env = "p2"))]
 mod wasi_github;
 #[cfg(all(target_os = "wasi", target_env = "p2"))]

@@ -1,4 +1,5 @@
 use crate::config::{self, ReviewConfig};
+use crate::review_search::{self, File, Side};
 #[cfg(all(target_os = "wasi", target_env = "p2"))]
 use crate::wasi_github::GitHub;
 use anyhow::{Context, Result, anyhow, ensure};
@@ -174,6 +175,7 @@ fn register_tools(
         pull.base.sha.clone(),
     );
     let head = head_repo.map(|repo| (repo.to_ascii_lowercase(), pull.head.sha.clone()));
+    let (search_base, search_head) = (base.clone(), head.clone());
     tools.register_async_rust(
         "repos_get_content",
         "Get GitHub Contents API JSON for a path at one of this PR's pinned repository and commit pairs.",
@@ -196,7 +198,64 @@ fn register_tools(
             }
         },
     )?;
+    let search_client = client.clone();
+    review_search::register(&mut tools, move |side, path| {
+        let client = search_client.clone();
+        let pair = match side {
+            Side::Base => Some(search_base.clone()),
+            Side::Head => search_head.clone(),
+        };
+        async move {
+            let Some((repository, reference)) = pair else {
+                return File::Skipped("head_unavailable");
+            };
+            let Ok(route) = file_route(&repository, &path) else {
+                return File::Skipped("invalid_path");
+            };
+            let query = [("ref", reference.as_str())];
+            let Ok(contents) = github_get::<Value>(&client, route, Some(&query), timeout).await
+            else {
+                return File::Skipped("unreadable");
+            };
+            decode_search_file(contents)
+        }
+    })?;
     Ok(tools)
+}
+
+fn decode_search_file(contents: Value) -> File {
+    use base64::{Engine, engine::general_purpose::STANDARD};
+
+    if contents["type"] != "file" {
+        return File::Skipped("not_a_file");
+    }
+    let Some(size) = contents["size"].as_u64() else {
+        return File::Skipped("unreadable");
+    };
+    if size > review_search::MAX_FILE_BYTES as u64 {
+        return File::Skipped("too_large");
+    }
+    let Some(encoded) = contents["content"]
+        .as_str()
+        .filter(|_| contents["encoding"] == "base64")
+    else {
+        return File::Skipped("unsupported_encoding");
+    };
+    let max_encoded = review_search::MAX_FILE_BYTES.div_ceil(3) * 4;
+    // Contents API base64 is line-wrapped. Limit the encoded payload too,
+    // rather than trusting a claimed file size.
+    let encoded: Vec<_> = encoded
+        .bytes()
+        .filter(|byte| !matches!(byte, b'\r' | b'\n'))
+        .take(max_encoded + 1)
+        .collect();
+    if encoded.len() > max_encoded {
+        return File::Skipped("too_large");
+    }
+    match STANDARD.decode(encoded) {
+        Ok(bytes) if bytes.len() as u64 == size => File::Bytes(bytes),
+        _ => File::Skipped("unreadable"),
+    }
 }
 
 async fn github_get<T: serde::de::DeserializeOwned>(
@@ -729,6 +788,14 @@ mod tests {
                 format!("/repos/contributor/fork/contents/src/new%20file.rs?ref={HEAD}"),
                 json!({"type":"file","size":8,"encoding":"base64","content":"bmV3IHRleHQ="}),
             ),
+            (
+                format!("/repos/contributor/fork/contents/src/new%20file.rs?ref={HEAD}"),
+                json!({"type":"file","size":8,"encoding":"base64","content":"bmV3\nIHRleHQ="}),
+            ),
+            (
+                format!("/repos/acme/project/contents/src/new%20file.rs?ref={BASE}"),
+                json!({"type":"file","size":8,"encoding":"base64","content":"b2xkIHRleHQ="}),
+            ),
         ];
         let worker = std::thread::spawn(move || {
             for (path, response) in expected {
@@ -778,7 +845,7 @@ mod tests {
         let tools = register_tools(&client, &target, &pr, &settings)?;
         let script = r#"
             const tools = mcp.listTools("rust");
-            if (tools.length !== 3) throw new Error("Unexpected capabilities");
+            if (tools.length !== 4) throw new Error("Unexpected capabilities");
             const pr = (await mcp.callTool("rust", "pulls_get", {})).structuredContent;
             if (pr.custom !== "kept") throw new Error("PR response was projected");
             const page = (await mcp.callTool("rust", "pulls_list_files", {page:1, per_page:10})).structuredContent;
@@ -788,6 +855,13 @@ mod tests {
                 path:page.items[0].filename
             });
             console.log(file.structuredContent.content);
+            for (const [side, expected] of [["head", "new text"], ["base", "old text"]]) {
+                const rg = (await mcp.callTool("rust", "rg", {
+                    side, pattern:"TEXT", paths:[page.items[0].filename], fixed_strings:true, ignore_case:true
+                })).structuredContent;
+                const found = rg.files[0].matches[0];
+                if (found.text !== expected || found.line !== 1) throw new Error(JSON.stringify(rg));
+            }
         "#;
         let runtime = Runtime::new()?;
         let result =
