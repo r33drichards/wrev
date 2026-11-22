@@ -24,6 +24,12 @@ hosting, supply the template's Sign in with ChatGPT access token through
 cargo run --locked -- review OWNER/REPO 123
 ```
 
+Native `wrev review` requires Git. It fetches the PR's base and head commits
+into a temporary repository and uses the same read-only tools as
+`wrev reviewbench CHECKOUT PR_JSON`. It reads Git objects without running code
+from the pull request. Set `WREV_SESSION_DIR` and build with
+`--features sqlite-backend` to persist checkpoints.
+
 ## ReviewBench results
 
 Wrev and the Codex CLI each reviewed the same 219 frozen pull requests from the
