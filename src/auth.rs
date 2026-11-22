@@ -74,6 +74,20 @@ fn random() -> String {
     OsRng.fill_bytes(&mut bytes);
     URL_SAFE_NO_PAD.encode(bytes)
 }
+fn new_host_id() -> String {
+    let mut bytes = [0_u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "urn:uuid:{}-{}-{}-{}-{}",
+        hex::encode(&bytes[..4]),
+        hex::encode(&bytes[4..6]),
+        hex::encode(&bytes[6..8]),
+        hex::encode(&bytes[8..10]),
+        hex::encode(&bytes[10..]),
+    )
+}
 fn challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
@@ -134,7 +148,7 @@ fn load(dir: &Path) -> Result<Store> {
     reject_symlink(&path)?;
     if !path.exists() {
         return Ok(Store {
-            host_id: format!("minimal-mcp-agent:{}", random()),
+            host_id: new_host_id(),
             ..Store::default()
         });
     }
@@ -143,7 +157,14 @@ fn load(dir: &Path) -> Result<Store> {
         fs::metadata(&path)?.permissions().mode() & 0o077 == 0,
         "Credential file must have owner-only permissions"
     );
-    serde_json::from_slice(&fs::read(path)?).context("Invalid local account store")
+    let mut store: Store =
+        serde_json::from_slice(&fs::read(path)?).context("Invalid local account store")?;
+    // A rejected first authorization leaves only the old invalid host ID.
+    // Do not change the identifier for an existing registration.
+    if store.accounts.is_empty() && store.host_id.starts_with("minimal-mcp-agent:") {
+        store.host_id = new_host_id();
+    }
+    Ok(store)
 }
 fn save(dir: &Path, store: &Store) -> Result<()> {
     // Never truncate the live credential file: rotating tokens replace it atomically.
@@ -634,6 +655,19 @@ mod tests {
             scope: Some("openid email".into()),
         };
         assert!(to_tokens(response, None).is_err());
+    }
+    #[test]
+    fn generates_uuid_v4_host_id() {
+        let id = new_host_id();
+        let uuid = id.strip_prefix("urn:uuid:").unwrap();
+        assert_eq!(
+            uuid.split('-').map(str::len).collect::<Vec<_>>(),
+            [8, 4, 4, 4, 12]
+        );
+        let bytes = hex::decode(uuid.replace('-', "")).unwrap();
+        assert_eq!(bytes[6] >> 4, 4);
+        assert_eq!(bytes[8] >> 6, 2);
+        assert_ne!(id, new_host_id());
     }
     #[test]
     #[cfg(unix)]
