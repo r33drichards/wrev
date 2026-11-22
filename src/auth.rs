@@ -120,7 +120,7 @@ fn store_dir() -> Result<PathBuf> {
         Ok(dir)
     }
 }
-fn lock(dir: &Path) -> Result<File> {
+fn lock(dir: &Path, wait: Duration) -> Result<File> {
     let path = dir.join("lock");
     reject_symlink(&path)?;
     let mut options = OpenOptions::new();
@@ -128,9 +128,23 @@ fn lock(dir: &Path) -> Result<File> {
     #[cfg(unix)]
     options.mode(0o600);
     let lock = options.open(path)?;
-    lock.try_lock_exclusive()
-        .context("Another agent process is signing in or refreshing; try again shortly")?;
-    Ok(lock)
+    let deadline = Instant::now() + wait;
+    loop {
+        match lock.try_lock_exclusive() {
+            Ok(()) => return Ok(lock),
+            Err(error)
+                if error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+                    && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => {
+                return Err(error).context(
+                    "Another agent process is signing in or refreshing; try again shortly",
+                );
+            }
+        }
+    }
 }
 fn reject_symlink(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
@@ -221,7 +235,7 @@ fn choose_account(store: &Store) -> Result<Option<usize>> {
 
 pub fn login() -> Result<()> {
     let dir = store_dir()?;
-    let _lock = lock(&dir)?;
+    let _lock = lock(&dir, Duration::ZERO)?;
     let mut store = load(&dir)?;
     save(&dir, &store)?; // Persist the stable host ID before its first authorization.
     let selected = choose_account(&store)?;
@@ -491,7 +505,7 @@ fn validate_identity(claims: &Claims, nonce: Option<&str>, timestamp: u64) -> Re
 
 pub fn access_token() -> Result<String> {
     let dir = store_dir()?;
-    let _lock = lock(&dir)?;
+    let _lock = lock(&dir, Duration::from_secs(45))?;
     let mut store = load(&dir)?;
     let index = store
         .active
@@ -534,7 +548,7 @@ pub fn access_token() -> Result<String> {
 
 pub fn logout() -> Result<()> {
     let dir = store_dir()?;
-    let _lock = lock(&dir)?;
+    let _lock = lock(&dir, Duration::ZERO)?;
     let mut store = load(&dir)?;
     if let Some(index) = store.active {
         let account = store
