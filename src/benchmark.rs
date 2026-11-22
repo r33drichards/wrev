@@ -8,9 +8,11 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use std::{
     env, fs,
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::Arc,
+    time::{Duration, Instant},
 };
 use tokio::runtime::Runtime;
 
@@ -194,31 +196,81 @@ fn register_search(
     let (tree_base, tree_head) = (base.clone(), head.clone());
     review_search::register(
         tools,
-        move |side| {
+        move |side, budget| {
+            let checkout = tree_checkout.clone();
             let reference = match side {
-                Side::Base => &tree_base,
-                Side::Head => &tree_head,
+                Side::Base => tree_base.clone(),
+                Side::Head => tree_head.clone(),
             };
-            std::future::ready(search_inventory(&tree_checkout, reference))
+            async move {
+                tokio::task::spawn_blocking(move || search_inventory(&checkout, &reference, budget))
+                    .await
+                    .context("Git inventory worker stopped")?
+            }
         },
-        move |side, path, remaining| {
+        move |side, path, remaining, _| {
+            let checkout = checkout.clone();
             let reference = match side {
-                Side::Base => &base,
-                Side::Head => &head,
+                Side::Base => base.clone(),
+                Side::Head => head.clone(),
             };
-            std::future::ready(search_blob(&checkout, reference, &path, remaining))
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    search_blob(&checkout, &reference, &path, remaining)
+                })
+                .await
+                .unwrap_or(File::Skipped("unreadable"))
+            }
         },
     )
 }
 
-fn search_inventory(checkout: &Path, reference: &str) -> Result<Inventory> {
-    let bytes = git(checkout, &["ls-tree", "-rz", "--full-tree", reference])?;
-    let mut truncated = false;
+fn search_inventory(checkout: &Path, reference: &str, budget: Duration) -> Result<Inventory> {
+    const MAX_TREE_BYTES: usize = 8 * 1024 * 1024;
+    let deadline = Instant::now() + budget;
+    let mut child = Command::new("git")
+        .args(["--no-pager", "--literal-pathspecs", "-C"])
+        .arg(checkout)
+        .args(["ls-tree", "-rz", "--full-tree", reference])
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let stdout = child.stdout.take().expect("git ls-tree stdout is piped");
+    let inventory = read_inventory(stdout, MAX_TREE_BYTES, deadline);
+    let incomplete = inventory.as_ref().map_or(true, |result| result.truncated);
+    if incomplete {
+        let _ = child.kill();
+    }
+    let status = child.wait()?;
+    ensure!(
+        incomplete || status.success(),
+        "Could not read pinned Git tree"
+    );
+    inventory
+}
+
+fn read_inventory(reader: impl Read, max_bytes: usize, deadline: Instant) -> Result<Inventory> {
+    let mut reader = BufReader::new(reader.take(max_bytes as u64 + 1));
+    let mut entry = Vec::new();
     let mut paths = Vec::new();
-    for entry in bytes
-        .split(|byte| *byte == 0)
-        .filter(|entry| !entry.is_empty())
-    {
+    let mut truncated = false;
+    let mut consumed = 0;
+    loop {
+        if Instant::now() >= deadline {
+            truncated = true;
+            break;
+        }
+        entry.clear();
+        let read = reader.read_until(0, &mut entry)?;
+        if read == 0 {
+            break;
+        }
+        consumed += read;
+        if consumed > max_bytes || entry.pop() != Some(0) {
+            truncated = true;
+            break;
+        }
         let Some(tab) = entry.iter().position(|byte| *byte == b'\t') else {
             truncated = true;
             continue;
@@ -307,6 +359,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn git_inventory_keeps_complete_records_when_capped() -> Result<()> {
+        let first = b"100644 blob abc\tfirst\0";
+        let mut input = first.to_vec();
+        input.extend_from_slice(b"100644 blob def\toversized-record\0");
+        let result = read_inventory(
+            input.as_slice(),
+            first.len() + 3,
+            Instant::now() + Duration::from_secs(1),
+        )?;
+        assert_eq!(result.paths, ["first"]);
+        assert!(result.truncated);
+        Ok(())
+    }
+
+    #[test]
     fn rg_uses_pinned_blobs_and_never_reads_worktree() -> Result<()> {
         let root = tempfile::tempdir()?;
         let checkout = root.path().join("repo");
@@ -336,6 +403,8 @@ mod tests {
         for n in 0..12 {
             fs::write(checkout.join(format!("a-{n:02}.txt")), "distractor\n")?;
         }
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("source.txt", checkout.join("named-needle-link"))?;
         fs::write(checkout.join("source.txt"), "header\nbase needle\n")?;
         let base = commit()?;
         fs::write(checkout.join("source.txt"), "header\nhead needle\n")?;
@@ -350,9 +419,10 @@ mod tests {
         let code = r#"
           const args = {pattern:"needle$"};
           const explicit = (await mcp.callTool("rust", "rg", {
-            ...args, paths:[...Array.from({length:12}, (_, n) => "a-"+String(n).padStart(2,"0")+".txt"), "source.txt","untracked.txt"]
+            ...args, paths:[...Array.from({length:12}, (_, n) => "a-"+String(n).padStart(2,"0")+".txt"), "source.txt","untracked.txt","named-needle-link"]
           })).structuredContent;
-          if (explicit.files[0].path !== "source.txt" || explicit.skipped[0].path !== "untracked.txt")
+          if (explicit.files[0].path !== "source.txt" || explicit.skipped[0].path !== "untracked.txt" ||
+              explicit.skipped[1].reason !== "not_a_file" || explicit.skipped[1].path !== "named-needle-link")
             throw new Error(JSON.stringify(explicit));
           for (const side of ["base", "head"]) {
             const r = (await mcp.callTool("rust", "rg", {...args, side})).structuredContent;

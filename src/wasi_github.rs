@@ -42,9 +42,9 @@ impl GitHub {
         query: Option<&impl Serialize>,
         timeout: Duration,
     ) -> Result<T> {
-        Ok(serde_json::from_reader(
+        Ok(serde_json::from_reader(BufReader::new(
             self.request(route, query, timeout)?,
-        )?)
+        ))?)
     }
 
     pub fn files(&self, route: String, query: &[(&str, u64)], timeout: Duration) -> Result<Value> {

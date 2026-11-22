@@ -203,7 +203,7 @@ fn register_tools(
     let search_client = client.clone();
     review_search::register(
         &mut tools,
-        move |side| {
+        move |side, budget| {
             let client = tree_client.clone();
             let pair = match side {
                 Side::Base => Some(tree_base.clone()),
@@ -212,8 +212,13 @@ fn register_tools(
             async move {
                 let (repository, reference) = pair.context("PR head repository unavailable")?;
                 let route = format!("/repos/{repository}/git/trees/{reference}");
-                let tree: SearchTree =
-                    github_get(&client, route, Some(&[("recursive", 1)]), timeout).await?;
+                let tree: SearchTree = github_get(
+                    &client,
+                    route,
+                    Some(&[("recursive", 1)]),
+                    timeout.min(budget),
+                )
+                .await?;
                 Ok(Inventory {
                     paths: tree
                         .tree
@@ -228,7 +233,7 @@ fn register_tools(
                 })
             }
         },
-        move |side, path, remaining| {
+        move |side, path, remaining, budget| {
             let client = search_client.clone();
             let pair = match side {
                 Side::Base => Some(search_base.clone()),
@@ -242,7 +247,8 @@ fn register_tools(
                     return File::Skipped("invalid_path");
                 };
                 let query = [("ref", reference.as_str())];
-                let Ok(contents) = github_get::<Value>(&client, route, Some(&query), timeout).await
+                let Ok(contents) =
+                    github_get::<Value>(&client, route, Some(&query), timeout.min(budget)).await
                 else {
                     return File::Skipped("unreadable");
                 };
@@ -846,6 +852,13 @@ mod tests {
                 json!({"type":"file","size":8,"encoding":"base64","content":"bmV3\nIHRleHQ="}),
             ),
             (
+                format!("/repos/acme/project/git/trees/{BASE}?recursive=1"),
+                json!({"truncated": false, "tree": [
+                    {"path":"src/new file.rs","mode":"100644","type":"blob"},
+                    {"path":"link.rs","mode":"120000","type":"blob"}
+                ]}),
+            ),
+            (
                 format!("/repos/acme/project/contents/src/new%20file.rs?ref={BASE}"),
                 json!({"type":"file","size":8,"encoding":"base64","content":"b2xkIHRleHQ="}),
             ),
@@ -910,11 +923,12 @@ mod tests {
             console.log(file.structuredContent.content);
             for (const [side, expected] of [["head", "new text"], ["base", "old text"]]) {
                 const rg = (await mcp.callTool("rust", "rg", {
-                    side, pattern:"TEXT", ...(side === "base" ? {paths:[page.items[0].filename]} : {}),
+                    side, pattern:"TEXT", ...(side === "base" ? {paths:[page.items[0].filename,"link.rs"]} : {}),
                     fixed_strings:true, ignore_case:true
                 })).structuredContent;
                 const found = rg.files[0].matches[0];
                 if (found.text !== expected || found.line !== 1) throw new Error(JSON.stringify(rg));
+                if (side === "base" && rg.skipped[0]?.reason !== "not_a_file") throw new Error(JSON.stringify(rg));
             }
         "#;
         let runtime = Runtime::new()?;

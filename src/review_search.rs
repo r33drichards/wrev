@@ -56,9 +56,9 @@ pub(crate) fn register<L, List, F, Read>(
     read: F,
 ) -> Result<()>
 where
-    L: Fn(Side) -> List + 'static,
+    L: Fn(Side, Duration) -> List + 'static,
     List: Future<Output = Result<Inventory>> + 'static,
-    F: Fn(Side, String, usize) -> Read + 'static,
+    F: Fn(Side, String, usize, Duration) -> Read + 'static,
     Read: Future<Output = File> + 'static,
 {
     let inventory = Rc::new(inventory);
@@ -79,7 +79,9 @@ where
             let read = read.clone();
             async move {
                 let request = serde_json::from_value(Value::Object(args))?;
-                search(request, move |side| inventory(side), move |side, path, remaining| read(side, path, remaining)).await
+                let budget = tool_timeout(Duration::from_secs(120)).saturating_sub(Duration::from_millis(250));
+                search(request, budget, move |side, budget| inventory(side, budget),
+                    move |side, path, remaining, budget| read(side, path, remaining, budget)).await
             }
         },
     )
@@ -92,11 +94,16 @@ fn valid_path(path: &str) -> bool {
         })
 }
 
-async fn search<L, List, F, Read>(request: Search, inventory: L, read: F) -> Result<Value>
+async fn search<L, List, F, Read>(
+    request: Search,
+    budget: Duration,
+    inventory: L,
+    read: F,
+) -> Result<Value>
 where
-    L: Fn(Side) -> List,
+    L: Fn(Side, Duration) -> List,
     List: Future<Output = Result<Inventory>>,
-    F: Fn(Side, String, usize) -> Read,
+    F: Fn(Side, String, usize, Duration) -> Read,
     Read: Future<Output = File>,
 {
     ensure!(
@@ -118,14 +125,28 @@ where
         .size_limit(1 << 20)
         .dfa_size_limit(1 << 20)
         .build(&request.pattern)?;
-    let timeout = tool_timeout(Duration::from_secs(120));
-    let deadline = Instant::now() + timeout.saturating_sub(Duration::from_millis(100));
-    let inventory = match request.paths {
-        Some(paths) => Inventory {
+    let deadline = Instant::now() + budget;
+    let mut stop_reason = None;
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let inventory = match tokio::time::timeout(remaining, inventory(request.side, remaining)).await
+    {
+        Ok(Ok(inventory)) => inventory,
+        Ok(Err(error)) if Instant::now() < deadline => return Err(error),
+        _ => {
+            stop_reason = Some("deadline");
+            Inventory {
+                paths: Vec::new(),
+                truncated: true,
+            }
+        }
+    };
+    let inventory_incomplete = inventory.truncated;
+    let (paths, allowed) = match request.paths {
+        Some(paths) => (
             paths,
-            truncated: false,
-        },
-        None => inventory(request.side).await?,
+            Some(inventory.paths.into_iter().collect::<HashSet<_>>()),
+        ),
+        None => (inventory.paths, None),
     };
     let mut searcher = SearcherBuilder::new().line_number(true).build();
     let mut seen = HashSet::new();
@@ -136,9 +157,11 @@ where
     let mut count = 0;
     let mut searched_bytes = 0;
     let mut result_bytes = 0;
-    let mut stop_reason = None;
 
-    for (index, path) in inventory.paths.into_iter().enumerate() {
+    for (index, path) in paths.into_iter().enumerate() {
+        if stop_reason.is_some() {
+            break;
+        }
         if index % 32 == 0 {
             tokio::task::yield_now().await;
         }
@@ -153,14 +176,40 @@ where
             stop_reason = Some("scan_bytes");
             break;
         }
-        if Instant::now() >= deadline {
+        let remaining_time = deadline.saturating_duration_since(Instant::now());
+        if remaining_time.is_zero() {
             stop_reason = Some("deadline");
             break;
         }
-        let input = if valid_path(&path) {
-            read(request.side, path.clone(), MAX_SCAN_BYTES - searched_bytes).await
-        } else {
+        let input = if !valid_path(&path) {
             File::Skipped("invalid_path")
+        } else if allowed
+            .as_ref()
+            .is_some_and(|entries| !entries.contains(&path))
+        {
+            File::Skipped(if inventory_incomplete {
+                "not_indexed"
+            } else {
+                "not_a_file"
+            })
+        } else {
+            match tokio::time::timeout(
+                remaining_time,
+                read(
+                    request.side,
+                    path.clone(),
+                    MAX_SCAN_BYTES - searched_bytes,
+                    remaining_time,
+                ),
+            )
+            .await
+            {
+                Ok(input) if Instant::now() < deadline => input,
+                _ => {
+                    stop_reason = Some("deadline");
+                    break;
+                }
+            }
         };
         let reason = match input {
             File::Bytes(bytes) if bytes.len() > MAX_SCAN_BYTES - searched_bytes => {
@@ -225,7 +274,7 @@ where
             break;
         }
     }
-    let stop_reason = stop_reason.or(inventory.truncated.then_some("inventory"));
+    let stop_reason = stop_reason.or(inventory_incomplete.then_some("inventory"));
     Ok(json!({
         "files": files, "skipped": skipped, "skipped_count": skipped_count,
         "truncated": stop_reason.is_some(), "stop_reason": stop_reason,
@@ -249,13 +298,16 @@ mod tests {
         let reads = std::cell::Cell::new(0);
         let result = search(
             req,
-            |_| {
+            Duration::from_secs(1),
+            |_, _| {
                 ready(Ok(Inventory {
-                    paths: vec![],
+                    paths: ["binary", "large", "text", "more"]
+                        .map(str::to_owned)
+                        .to_vec(),
                     truncated: false,
                 }))
             },
-            |_, path, _| {
+            |_, path, _, _| {
                 reads.set(reads.get() + 1);
                 if path == "large" {
                     return ready(File::Skipped("too_large"));
@@ -289,17 +341,45 @@ mod tests {
         let req = serde_json::from_value(json!({"pattern":"needle"}))?;
         let result = search(
             req,
-            |_| {
+            Duration::from_secs(1),
+            |_, _| {
                 ready(Ok(Inventory {
                     paths: (0..100).map(|i| format!("file-{i:03}")).collect(),
                     truncated: false,
                 }))
             },
-            |_, _, _| ready(File::Bytes(b"needle\n".to_vec())),
+            |_, _, _, _| ready(File::Bytes(b"needle\n".to_vec())),
         )
         .await?;
         assert_eq!(result["files"].as_array().unwrap().len(), 100);
         assert_eq!(result["truncated"], false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn slow_read_keeps_earlier_matches() -> Result<()> {
+        let req = serde_json::from_value(json!({"pattern":"needle"}))?;
+        let result = search(
+            req,
+            Duration::from_millis(100),
+            |_, _| {
+                ready(Ok(Inventory {
+                    paths: vec!["first".into(), "slow".into()],
+                    truncated: false,
+                }))
+            },
+            |_, path, _, budget| async move {
+                if path == "slow" {
+                    assert!(budget <= Duration::from_millis(100));
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                }
+                File::Bytes(b"needle\n".to_vec())
+            },
+        )
+        .await?;
+        assert_eq!(result["files"][0]["path"], "first");
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["stop_reason"], "deadline");
         Ok(())
     }
 
@@ -315,10 +395,11 @@ mod tests {
             assert!(
                 search(
                     req,
-                    |_| -> std::future::Ready<Result<Inventory>> {
+                    Duration::from_secs(1),
+                    |_, _| -> std::future::Ready<Result<Inventory>> {
                         panic!("invalid requests must not list")
                     },
-                    |_, _, _| -> std::future::Ready<File> {
+                    |_, _, _, _| -> std::future::Ready<File> {
                         panic!("invalid requests must not read")
                     }
                 )
