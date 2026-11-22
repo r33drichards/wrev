@@ -50,6 +50,10 @@ struct Pull {
     base: Ref,
     head: Ref,
     labels: Vec<Label>,
+    #[cfg(not(all(target_os = "wasi", target_env = "p2")))]
+    title: Option<String>,
+    #[cfg(not(all(target_os = "wasi", target_env = "p2")))]
+    body: Option<String>,
 }
 
 #[cfg(not(all(target_os = "wasi", target_env = "p2")))]
@@ -68,7 +72,7 @@ struct EventPull {
     head: Ref,
 }
 
-fn allowed_repo(name: &str) -> bool {
+pub(crate) fn allowed_repo(name: &str) -> bool {
     name.split_once('/').is_some_and(|(owner, repo)| {
         [owner, repo].iter().all(|part| {
             !part.is_empty()
@@ -81,7 +85,7 @@ fn allowed_repo(name: &str) -> bool {
     })
 }
 
-fn valid_sha(sha: &str) -> bool {
+pub(crate) fn valid_sha(sha: &str) -> bool {
     sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
@@ -266,6 +270,45 @@ fn run_review(
         "Pull request is closed, changed, or no longer labeled"
     );
     let tools = register_tools(client, target, &pr, settings)?;
+    let input = include_str!("review_prompt.md");
+    let identity = format!(
+        "{}#{}:{}:{}",
+        target.repository, target.number, target.head, pr.base.sha
+    );
+    let review = run_agent(
+        runtime,
+        settings,
+        model_client,
+        &tools,
+        &identity,
+        input,
+        access_token,
+    )?;
+    let final_pr = runtime.block_on(pull(
+        client,
+        &target.repository,
+        target.number,
+        settings.github_timeout,
+    ))?;
+    ensure!(
+        eligible(&final_pr) && final_pr.base.sha == pr.base.sha,
+        "Pull request changed during review"
+    );
+    Ok(
+        json!({"repository": target.repository, "number": target.number,
+        "head": target.head, "review": review}),
+    )
+}
+
+pub(crate) fn run_agent(
+    runtime: &Runtime,
+    settings: &ReviewConfig,
+    model_client: &crate::model::Client,
+    tools: &QuickJsTools,
+    _identity: &str,
+    input: &str,
+    access_token: impl Fn() -> Result<String>,
+) -> Result<String> {
     let definitions = QuickJsTools::definitions();
     let prompt = |messages: &[Value]| {
         crate::model::prompt(
@@ -277,21 +320,16 @@ fn run_review(
         )
     };
     let tool = |name: &str, args: &str| runtime.block_on(tools.call(name, args, false));
-    let input = include_str!("review_prompt.md");
     let mut messages = Vec::new();
     #[cfg(feature = "sqlite-backend")]
     if let Some(dir) = env::var_os("WREV_SESSION_DIR") {
         use minimal_mcp_agent::durable::{Turn, run_durable_turn};
         use minimal_mcp_agent::durable_sqlite::SqliteBackend;
         let backend = SqliteBackend::new(std::path::PathBuf::from(dir));
-        let identity = format!(
-            "{}#{}:{}:{}",
-            target.repository, target.number, target.head, pr.base.sha
-        );
         messages = run_durable_turn(
             &backend,
             Turn {
-                session_id: &identity,
+                session_id: _identity,
                 request_id: "review",
                 input,
                 max_rounds: usize::MAX,
@@ -309,7 +347,7 @@ fn run_review(
     }
     #[cfg(not(feature = "sqlite-backend"))]
     agent::run_turn(&mut messages, input, None, prompt, tool, |_| {})?;
-    let review = messages
+    messages
         .iter()
         .rev()
         .filter(|item| {
@@ -326,21 +364,47 @@ fn run_review(
                 .join("\n");
             (!text.trim().is_empty()).then_some(text)
         })
-        .context("Model returned no final review")?;
-    let final_pr = runtime.block_on(pull(
-        client,
-        &target.repository,
-        target.number,
-        settings.github_timeout,
-    ))?;
-    ensure!(
-        eligible(&final_pr) && final_pr.base.sha == pr.base.sha,
-        "Pull request changed during review"
-    );
-    Ok(
-        json!({"repository": target.repository, "number": target.number,
-        "head": target.head, "review": review}),
-    )
+        .context("Model returned no final review")
+}
+
+pub(crate) fn benchmark_findings(
+    repository: &str,
+    number: u64,
+    base: &str,
+    head: &str,
+    review: &str,
+) -> Result<Value> {
+    let review = review.trim();
+    let review = review
+        .strip_prefix("```json")
+        .or_else(|| review.strip_prefix("```"))
+        .and_then(|body| body.strip_suffix("```"))
+        .unwrap_or(review);
+    let result: Value =
+        serde_json::from_str(review).context("Wrev returned invalid ReviewBench JSON")?;
+    let findings = result["findings"]
+        .as_array()
+        .context("Wrev returned no findings array")?
+        .iter()
+        .map(|finding| {
+            let mut finding = finding
+                .as_object()
+                .context("Invalid ReviewBench finding")?
+                .clone();
+            finding.insert("producer".into(), json!("wrev"));
+            Ok(Value::Object(finding))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(json!({
+        "pr": {
+            "repo": format!("https://github.com/{repository}"),
+            "pr_number": number,
+            "base": base,
+            "head": head
+        },
+        "agent": "wrev",
+        "findings": findings
+    }))
 }
 
 pub fn manual() -> Result<()> {
@@ -367,21 +431,65 @@ pub fn manual() -> Result<()> {
         );
     }
     let required_label = env::var("WREV_REQUIRED_LABEL").ok();
-    let review = run_review(
-        &runtime,
-        &client,
-        &settings,
-        &crate::model::client()?,
-        &Target {
-            repository,
-            number,
+    #[cfg(not(all(target_os = "wasi", target_env = "p2")))]
+    {
+        let eligible = |pr: &Pull| {
+            pr.state == "open"
+                && required_label
+                    .as_ref()
+                    .is_none_or(|label| pr.labels.iter().any(|entry| &entry.name == label))
+        };
+        ensure!(
+            eligible(&current),
+            "Pull request is closed or no longer labeled"
+        );
+        let snapshot = crate::benchmark::Snapshot {
+            nwo: repository,
+            pr_number: number,
+            base: current.base.sha,
             head: current.head.sha,
-        },
-        required_label.as_deref(),
-        config::chatgpt_token,
-    )?;
-    println!("{review}");
-    Ok(())
+            title: current.title,
+            body: current.body,
+        };
+        let checkout = crate::benchmark::fetch(&snapshot, &config::required("WREV_GITHUB_TOKEN")?)?;
+        let mut result = crate::benchmark::review_snapshot(checkout.path(), &snapshot)?;
+        let latest = runtime.block_on(pull(
+            &client,
+            &snapshot.nwo,
+            number,
+            settings.github_timeout,
+        ))?;
+        ensure!(
+            eligible(&latest)
+                && latest.base.sha == snapshot.base
+                && latest.head.sha == snapshot.head,
+            "Pull request changed during review"
+        );
+        result["repository"] = json!(snapshot.nwo);
+        result["number"] = json!(number);
+        result["head"] = json!(snapshot.head);
+        result["review"] = json!(result["findings"].to_string());
+        println!("{result}");
+        Ok(())
+    }
+    #[cfg(all(target_os = "wasi", target_env = "p2"))]
+    {
+        let review = run_review(
+            &runtime,
+            &client,
+            &settings,
+            &crate::model::client()?,
+            &Target {
+                repository,
+                number,
+                head: current.head.sha,
+            },
+            required_label.as_deref(),
+            config::chatgpt_token,
+        )?;
+        println!("{review}");
+        Ok(())
+    }
 }
 
 #[cfg(all(test, not(all(target_os = "wasi", target_env = "p2"))))]

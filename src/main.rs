@@ -3,6 +3,8 @@ mod auth;
 #[cfg(not(unix))]
 #[path = "auth_headless.rs"]
 mod auth;
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
+mod benchmark;
 mod config;
 #[cfg(feature = "mysql-backend")]
 mod hosted_auth;
@@ -31,9 +33,13 @@ fn main() -> Result<()> {
         #[cfg(not(all(target_os = "wasi", target_env = "p2")))]
         Some("wcgi") => review::wcgi(),
         Some("review") => review::manual(),
+        #[cfg(not(all(target_os = "wasi", target_env = "p2")))]
+        Some("reviewbench") => benchmark::run(),
         None | Some("-h" | "--help") => {
             #[cfg(not(all(target_os = "wasi", target_env = "p2")))]
-            println!("wrev [login | logout | models | wcgi | review OWNER/REPO PR_NUMBER]");
+            println!(
+                "wrev [login | logout | models | wcgi | review OWNER/REPO PR_NUMBER | reviewbench CHECKOUT PR_JSON]"
+            );
             #[cfg(all(target_os = "wasi", target_env = "p2"))]
             println!("wrev [models | review OWNER/REPO PR_NUMBER]");
             Ok(())
