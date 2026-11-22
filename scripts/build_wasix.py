@@ -94,6 +94,15 @@ manifest = manifest.replace('reqwest?/rustls"', 'reqwest?/rustls-tls"')
 (octocrab / 'Cargo.toml').write_text(manifest)
 
 manifest = (PROJECT / 'Cargo.toml').read_text()
+# The deployed Wasmer listener still uses its WASIX dependency overlay.
+# Omit the separate Preview 2 command's dependencies from its lockfile.
+preview2 = """[target.'cfg(all(target_os = "wasi", target_env = "p2"))'.dependencies]
+wasi = "0.14"
+serde_urlencoded = "0.7"
+
+"""
+assert manifest.count(preview2) == 1
+manifest = manifest.replace(preview2, '')
 old = 'reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls", "form"] }'
 new = 'reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls", "stream"] }'
 assert old in manifest

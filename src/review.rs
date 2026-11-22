@@ -1,18 +1,23 @@
 use crate::config::{self, ReviewConfig};
+#[cfg(all(target_os = "wasi", target_env = "p2"))]
+use crate::wasi_github::GitHub;
 use anyhow::{Context, Result, anyhow, ensure};
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
 use hmac::{Hmac, Mac};
 use minimal_mcp_agent::{agent, quickjs_tools::QuickJsTools};
-use octocrab::{Octocrab, Page};
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
+use octocrab::{Octocrab as GitHub, Page};
 use serde::Deserialize;
 use serde_json::{Value, json};
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
 use sha2::Sha256;
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
 use std::{
     collections::HashSet,
-    env,
     io::{self, Read, Write},
-    time::Duration,
 };
-#[cfg(test)]
+use std::{env, time::Duration};
+#[cfg(all(test, not(all(target_os = "wasi", target_env = "p2"))))]
 use tiny_http::{Method, Request, Response, Server};
 use tokio::runtime::Runtime;
 
@@ -47,6 +52,7 @@ struct Pull {
     labels: Vec<Label>,
 }
 
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
 #[derive(Deserialize)]
 struct PullEvent {
     action: String,
@@ -56,6 +62,7 @@ struct PullEvent {
     pull_request: EventPull,
 }
 
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
 #[derive(Deserialize)]
 struct EventPull {
     head: Ref,
@@ -78,25 +85,31 @@ fn valid_sha(sha: &str) -> bool {
     sha.len() == 40 && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-fn authenticate(runtime: &Runtime) -> Result<Octocrab> {
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
+fn authenticate(runtime: &Runtime) -> Result<GitHub> {
     let _runtime = runtime.enter();
     let token = config::required("WREV_GITHUB_TOKEN")?;
-    Ok(Octocrab::builder().personal_token(token).build()?)
+    Ok(GitHub::builder().personal_token(token).build()?)
 }
 
-async fn pull(client: &Octocrab, repository: &str, number: u64, timeout: Duration) -> Result<Pull> {
+#[cfg(all(target_os = "wasi", target_env = "p2"))]
+fn authenticate(_: &Runtime) -> Result<GitHub> {
+    Ok(GitHub::new(config::required("WREV_GITHUB_TOKEN")?))
+}
+
+async fn pull(client: &GitHub, repository: &str, number: u64, timeout: Duration) -> Result<Pull> {
     ensure!(
         allowed_repo(repository) && number > 0,
         "Invalid pull request identity"
     );
     let route = format!("/repos/{repository}/pulls/{number}");
-    tokio::time::timeout(timeout, client.get(route, None::<&()>))
-        .await?
+    github_get(client, route, None::<&()>, timeout)
+        .await
         .context("Read pull request")
 }
 
 fn register_tools(
-    client: &Octocrab,
+    client: &GitHub,
     target: &Target,
     pull: &Pull,
     settings: &ReviewConfig,
@@ -122,14 +135,14 @@ fn register_tools(
         move |_| {
             let client = pull_client.clone();
             let route = pull_route.clone();
-            async move { Ok(tokio::time::timeout(timeout, client.get(route, None::<&()>)).await??) }
+            async move { github_get(&client, route, None::<&()>, timeout).await }
         },
     )?;
 
     let files_client = client.clone();
     tools.register_async_rust(
         "pulls_list_files",
-        "List files for the authorized pull request. Returns an Octocrab page with items and pagination links.",
+        "List files for the authorized pull request. Returns an Octocrab-compatible page with items and pagination links.",
         json!({"type":"object","properties":{
             "page":{"type":"integer","minimum":1},
             "per_page":{"type":"integer","minimum":1,"maximum":100}
@@ -146,10 +159,7 @@ fn register_tools(
                         query.push((key, value));
                     }
                 }
-                let page: Page<Value> = tokio::time::timeout(
-                    timeout, client.get(route, Some(&query)),
-                ).await??;
-                Ok(serde_json::to_value(page)?)
+                github_files(&client, route, &query, timeout).await
             }
         },
     )?;
@@ -178,13 +188,39 @@ fn register_tools(
                 let pair = (repository, reference.to_owned());
                 ensure!(pair == base || head.as_ref() == Some(&pair), "Repository and ref are outside this review");
                 let route = file_route(&pair.0, path)?;
-                Ok(tokio::time::timeout(
-                    timeout, client.get(route, Some(&[("ref", reference)])),
-                ).await??)
+                github_get(&client, route, Some(&[("ref", reference)]), timeout).await
             }
         },
     )?;
     Ok(tools)
+}
+
+async fn github_get<T: serde::de::DeserializeOwned>(
+    client: &GitHub,
+    route: String,
+    query: Option<&impl serde::Serialize>,
+    timeout: Duration,
+) -> Result<T> {
+    #[cfg(not(all(target_os = "wasi", target_env = "p2")))]
+    return Ok(tokio::time::timeout(timeout, client.get(route, query)).await??);
+    #[cfg(all(target_os = "wasi", target_env = "p2"))]
+    client.get(route, query, timeout)
+}
+
+async fn github_files(
+    client: &GitHub,
+    route: String,
+    query: &[(&str, u64)],
+    timeout: Duration,
+) -> Result<Value> {
+    #[cfg(not(all(target_os = "wasi", target_env = "p2")))]
+    {
+        let page: Page<Value> =
+            tokio::time::timeout(timeout, client.get(route, Some(&query))).await??;
+        Ok(serde_json::to_value(page)?)
+    }
+    #[cfg(all(target_os = "wasi", target_env = "p2"))]
+    client.files(route, query, timeout)
 }
 
 fn file_route(repository: &str, path: &str) -> Result<String> {
@@ -195,7 +231,7 @@ fn file_route(repository: &str, path: &str) -> Result<String> {
             }),
         "Invalid repository file path"
     );
-    let mut url = reqwest::Url::parse(&format!(
+    let mut url = url::Url::parse(&format!(
         "https://api.github.com/repos/{repository}/contents"
     ))?;
     url.path_segments_mut()
@@ -206,9 +242,9 @@ fn file_route(repository: &str, path: &str) -> Result<String> {
 
 fn run_review(
     runtime: &Runtime,
-    client: &Octocrab,
+    client: &GitHub,
     settings: &ReviewConfig,
-    model_client: &reqwest::blocking::Client,
+    model_client: &crate::model::Client,
     target: &Target,
     required_label: Option<&str>,
     access_token: impl Fn() -> Result<String>,
@@ -289,7 +325,12 @@ pub fn manual() -> Result<()> {
         .context("Usage: wrev review OWNER/REPO PR_NUMBER")?;
     let number = args.next().context("Missing PR number")?.parse()?;
     ensure!(args.next().is_none(), "Unexpected arguments");
+    #[cfg(not(all(target_os = "wasi", target_env = "p2")))]
     let runtime = Runtime::new()?;
+    #[cfg(all(target_os = "wasi", target_env = "p2"))]
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()?;
     let client = authenticate(&runtime)?;
     let settings = ReviewConfig::from_env()?;
     let current = runtime.block_on(pull(&client, &repository, number, settings.github_timeout))?;
@@ -310,7 +351,7 @@ pub fn manual() -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(target_os = "wasi", target_env = "p2"))))]
 pub(crate) fn header(request: &Request, name: &'static str) -> Option<String> {
     let mut matches = request
         .headers()
@@ -320,6 +361,7 @@ pub(crate) fn header(request: &Request, name: &'static str) -> Option<String> {
     matches.next().is_none().then_some(first)
 }
 
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
 fn signed(secret: &[u8], signature: &str, body: &[u8]) -> bool {
     if signature.len() != 71 {
         return false;
@@ -335,6 +377,7 @@ fn signed(secret: &[u8], signature: &str, body: &[u8]) -> bool {
     mac.verify_slice(&bytes).is_ok()
 }
 
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
 fn labeled_target(
     body: &[u8],
     repositories: &HashSet<String>,
@@ -360,6 +403,7 @@ fn labeled_target(
     }))
 }
 
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
 fn repositories() -> Result<HashSet<String>> {
     let repositories: HashSet<_> = config::required("WREV_REPOSITORIES")?
         .split(',')
@@ -372,6 +416,7 @@ fn repositories() -> Result<HashSet<String>> {
     Ok(repositories)
 }
 
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
 fn webhook_target(
     body: impl Read,
     signature: Option<&str>,
@@ -401,6 +446,7 @@ fn webhook_target(
         .ok_or(204)
 }
 
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
 fn wcgi_request(method: &str, path: &str) -> Result<u16> {
     match (method, path) {
         ("GET", "/health") => {
@@ -465,6 +511,7 @@ fn wcgi_request(method: &str, path: &str) -> Result<u16> {
     }
 }
 
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
 pub fn wcgi() -> Result<()> {
     let method = env::var("REQUEST_METHOD").unwrap_or_default();
     let uri = env::var("REQUEST_URI").unwrap_or_default();
@@ -493,7 +540,7 @@ pub fn wcgi() -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(all(target_os = "wasi", target_env = "p2"))))]
 mod tests {
     use super::*;
 
@@ -567,7 +614,7 @@ mod tests {
         let runtime = Runtime::new()?;
         let client = {
             let _runtime = runtime.enter();
-            Octocrab::builder()
+            GitHub::builder()
                 .base_uri(endpoint)?
                 .personal_token("test-token".to_owned())
                 .build()?

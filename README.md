@@ -37,6 +37,16 @@ GitHub expects a webhook response within 10 seconds. A longer review can appear
 as a timed-out delivery, and a redelivery can run the review again. WCGI has no
 cross-invocation queue or deduplication. `GET /health` checks webhook configuration.
 
+## Run reviews in Wasmtime
+
+Build the WASI Preview 2 command with `cargo build --locked --release --target
+wasm32-wasip2 --bin wrev` and run it with Wasmtime 51. It supports `review`
+and `models`, with HTTPS requests provided by the host through WASI HTTP.
+Supply credentials through the host environment. The Wasmer WCGI deployment
+can still receive webhooks directly. To use the Wasmtime component from a
+webhook server, configure that server to invoke `review OWNER/REPO PR_NUMBER`.
+See [build and run instructions](BUILD.md#wasmtime).
+
 ## Deployment configuration
 
 `wrev` loads deployment settings with the Rust `config` crate. Set each option

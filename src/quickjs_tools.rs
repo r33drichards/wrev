@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, anyhow, ensure};
+#[cfg(not(all(target_os = "wasi", target_env = "p2")))]
 use rmcp::{RoleClient, model::CallToolRequestParams, service::Peer};
 use rquickjs::{
     AsyncContext, AsyncRuntime, CatchResultExt, Function, Promise,
@@ -15,6 +16,20 @@ use std::{
     time::Duration,
 };
 use tokio::time::{Instant, timeout_at};
+
+#[cfg(all(target_os = "wasi", target_env = "p2"))]
+tokio::task_local! {
+    // The component's synchronous WASI HTTP polling must honor the script's
+    // remaining time even while the Tokio timer cannot be polled.
+    static SCRIPT_DEADLINE: Instant;
+}
+
+#[cfg(all(target_os = "wasi", target_env = "p2"))]
+pub fn tool_timeout(timeout: Duration) -> Duration {
+    SCRIPT_DEADLINE
+        .try_with(|deadline| timeout.min(deadline.saturating_duration_since(Instant::now())))
+        .unwrap_or(timeout)
+}
 
 /// Resource limits applied to each JavaScript invocation.
 #[derive(Clone, Copy)]
@@ -50,6 +65,7 @@ type RustToolHandler = dyn Fn(Arguments) -> RustToolFuture;
 
 #[derive(Clone)]
 enum ToolHandler {
+    #[cfg(not(all(target_os = "wasi", target_env = "p2")))]
     Mcp(Peer<RoleClient>),
     Rust(Rc<RustToolHandler>),
 }
@@ -72,6 +88,7 @@ impl QuickJsTools {
         }
     }
 
+    #[cfg(not(all(target_os = "wasi", target_env = "p2")))]
     /// Register a discovered MCP tool and the connection that serves it.
     pub fn register_mcp(
         &mut self,
@@ -230,6 +247,7 @@ impl QuickJsTools {
                         }
                         pending.set(pending.get() + 1);
                         let result = match handler {
+                            #[cfg(not(all(target_os = "wasi", target_env = "p2")))]
                             ToolHandler::Mcp(peer) => match peer
                                 .call_tool(CallToolRequestParams::new(name).with_arguments(args))
                                 .await
@@ -241,16 +259,21 @@ impl QuickJsTools {
                                     Err(js_error("MCP call failed with an unknown outcome"))
                                 }
                             },
-                            ToolHandler::Rust(handler) => match handler(args).await {
-                                Ok(value) => {
-                                    Ok(json!({"content": [], "structuredContent": value})
-                                        .to_string())
+                            ToolHandler::Rust(handler) => {
+                                let call = handler(args);
+                                #[cfg(all(target_os = "wasi", target_env = "p2"))]
+                                let call = SCRIPT_DEADLINE.scope(deadline, call);
+                                match call.await {
+                                    Ok(value) => {
+                                        Ok(json!({"content": [], "structuredContent": value})
+                                            .to_string())
+                                    }
+                                    Err(_) => {
+                                        uncertain.set(true);
+                                        Err(js_error("Rust tool failed"))
+                                    }
                                 }
-                                Err(_) => {
-                                    uncertain.set(true);
-                                    Err(js_error("Rust tool failed"))
-                                }
-                            },
+                            }
                         };
                         pending.set(pending.get() - 1);
                         result

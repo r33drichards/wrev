@@ -2647,6 +2647,7 @@ dependencies = [
  "subtle",
  "tiny_http",
  "tokio",
+ "url",
 ]
 
 [[package]]
