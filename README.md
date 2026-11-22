@@ -5,7 +5,7 @@ loop and embeds QuickJS. JavaScript gets three PR-scoped Rust tools backed by
 Octocrab. Use `pulls_get` for PR metadata, `pulls_list_files` for changed-file pages,
 and `repos_get_content` for Contents API data at the pinned base or head.
 The tools preserve GitHub response fields and leave pagination and decoding
-to the caller. The runner writes a JSON review to stdout.
+to the caller. The runner writes a JSON review to stdout. The Railway worker stores that result with the review session.
 
 ## Run
 
