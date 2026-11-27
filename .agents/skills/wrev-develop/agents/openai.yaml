@@ -1,0 +1,4 @@
+interface:
+  display_name: "Wrev Feature Development"
+  short_description: "Develop and test Wrev across Rust and Go"
+  default_prompt: "Use $wrev-develop to implement and verify this feature across the Wrev reviewer and webhook worker."
